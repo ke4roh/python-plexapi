@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
+from urllib.parse import quote_plus
+
+import pytest
+from plexapi.exceptions import BadRequest
+
 from . import conftest as utils
-from . import test_mixins
+from . import test_media, test_mixins
 
 
 def test_audio_Artist_attr(artist):
@@ -11,13 +16,15 @@ def test_audio_Artist_attr(artist):
         assert utils.is_art(artist.art)
     if artist.countries:
         assert "United States of America" in [i.tag for i in artist.countries]
-    #assert "Electronic" in [i.tag for i in artist.genres]
+    # assert "Electronic" in [i.tag for i in artist.genres]
     assert utils.is_string(artist.guid, gte=5)
     assert artist.index == 1
     assert utils.is_metadata(artist._initpath)
     assert utils.is_metadata(artist.key)
     assert utils.is_int(artist.librarySectionID)
     assert artist.listType == "audio"
+    assert utils.is_datetime(artist.lastRatedAt)
+    assert utils.is_datetime(artist.lastViewedAt)
     assert len(artist.locations) == 1
     assert len(artist.locations[0]) >= 10
     assert artist.ratingKey >= 1
@@ -34,9 +41,9 @@ def test_audio_Artist_attr(artist):
     assert utils.is_int(artist.viewCount, gte=0)
 
 
-def test_audio_Artist_get(artist, music):
-    artist == music.searchArtists(**{"title": "Broke For Free"})[0]
-    artist.title == "Broke For Free"
+def test_audio_Artist_get(artist):
+    track = artist.get(album="Layers", title="As Colourful as Ever")
+    assert track.title == "As Colourful as Ever"
 
 
 def test_audio_Artist_history(artist):
@@ -50,6 +57,8 @@ def test_audio_Artist_track(artist):
     track = artist.track(album="Layers", track=1)
     assert track.parentTitle == "Layers"
     assert track.index == 1
+    with pytest.raises(BadRequest):
+        artist.track()
 
 
 def test_audio_Artist_tracks(artist):
@@ -67,11 +76,27 @@ def test_audio_Artist_albums(artist):
     assert len(albums) == 1 and albums[0].title == "Layers"
 
 
+def test_audio_Artist_hubs(artist):
+    hubs = artist.hubs()
+    assert isinstance(hubs, list)
+
+
+def test_audio_Artist_mixins_edit_advanced_settings(artist):
+    test_mixins.edit_advanced_settings(artist)
+
+
+@pytest.mark.xfail(reason="Changing images fails randomly")
 def test_audio_Artist_mixins_images(artist):
+    test_mixins.lock_art(artist)
+    test_mixins.lock_poster(artist)
     test_mixins.edit_art(artist)
     test_mixins.edit_poster(artist)
     test_mixins.attr_artUrl(artist)
     test_mixins.attr_posterUrl(artist)
+
+
+def test_audio_Artist_mixins_rating(artist):
+    test_mixins.edit_rating(artist)
 
 
 def test_audio_Artist_mixins_tags(artist):
@@ -83,14 +108,35 @@ def test_audio_Artist_mixins_tags(artist):
     test_mixins.edit_style(artist)
 
 
+def test_audio_Artist_media_tags(artist):
+    artist.reload()
+    test_media.tag_collection(artist)
+    test_media.tag_country(artist)
+    test_media.tag_genre(artist)
+    test_media.tag_mood(artist)
+    test_media.tag_similar(artist)
+    test_media.tag_style(artist)
+
+
+def test_audio_Artist_PlexWebURL(plex, artist):
+    url = artist.getWebURL()
+    assert url.startswith('https://app.plex.tv/desktop')
+    assert plex.machineIdentifier in url
+    assert 'details' in url
+    assert quote_plus(artist.key) in url
+
+
 def test_audio_Album_attrs(album):
     assert utils.is_datetime(album.addedAt)
     if album.art:
         assert utils.is_art(album.art)
+    assert isinstance(album.formats, list)
     assert isinstance(album.genres, list)
     assert album.index == 1
     assert utils.is_metadata(album._initpath)
     assert utils.is_metadata(album.key)
+    assert utils.is_datetime(album.lastRatedAt)
+    assert utils.is_datetime(album.lastViewedAt)
     assert utils.is_int(album.librarySectionID)
     assert album.listType == "audio"
     assert utils.is_datetime(album.originallyAvailableAt)
@@ -102,6 +148,7 @@ def test_audio_Album_attrs(album):
     assert album.ratingKey >= 1
     assert album._server._baseurl == utils.SERVER_BASEURL
     assert album.studio == "[no label]"
+    assert isinstance(album.subformats, list)
     assert album.summary == ""
     if album.thumb:
         assert utils.is_thumb(album.thumb)
@@ -133,6 +180,8 @@ def test_audio_Album_track(album, track=None):
     track = track or album.track("As Colourful As Ever")
     track2 = album.track(track=1)
     assert track == track2
+    with pytest.raises(BadRequest):
+        album.track()
 
 
 def test_audio_Album_get(album):
@@ -146,11 +195,18 @@ def test_audio_Album_artist(album):
     artist.title == "Broke For Free"
 
 
+@pytest.mark.xfail(reason="Changing images fails randomly")
 def test_audio_Album_mixins_images(album):
+    test_mixins.lock_art(album)
+    test_mixins.lock_poster(album)
     test_mixins.edit_art(album)
     test_mixins.edit_poster(album)
     test_mixins.attr_artUrl(album)
     test_mixins.attr_posterUrl(album)
+
+
+def test_audio_Album_mixins_rating(album):
+    test_mixins.edit_rating(album)
 
 
 def test_audio_Album_mixins_tags(album):
@@ -159,6 +215,23 @@ def test_audio_Album_mixins_tags(album):
     test_mixins.edit_label(album)
     test_mixins.edit_mood(album)
     test_mixins.edit_style(album)
+
+
+def test_audio_Album_media_tags(album):
+    album.reload()
+    test_media.tag_collection(album)
+    test_media.tag_genre(album)
+    test_media.tag_label(album)
+    test_media.tag_mood(album)
+    test_media.tag_style(album)
+
+
+def test_audio_Album_PlexWebURL(plex, album):
+    url = album.getWebURL()
+    assert url.startswith('https://app.plex.tv/desktop')
+    assert plex.machineIdentifier in url
+    assert 'details' in url
+    assert quote_plus(album.key) in url
 
 
 def test_audio_Track_attrs(album):
@@ -176,9 +249,12 @@ def test_audio_Track_attrs(album):
         assert utils.is_thumb(track.grandparentThumb)
     assert track.grandparentTitle == "Broke For Free"
     assert track.guid.startswith("mbid://") or track.guid.startswith("plex://track/")
-    assert int(track.index) == 1
+    assert track.hasSonicAnalysis is False
+    assert track.index == 1
+    assert track.trackNumber == track.index
     assert utils.is_metadata(track._initpath)
     assert utils.is_metadata(track.key)
+    assert utils.is_datetime(track.lastRatedAt)
     assert utils.is_datetime(track.lastViewedAt)
     assert utils.is_int(track.librarySectionID)
     assert track.listType == "audio"
@@ -212,6 +288,7 @@ def test_audio_Track_attrs(album):
     assert track.viewOffset == 0
     assert track.viewedAt is None
     assert track.year is None
+    assert track.url(None) is None
     assert media.aspectRatio is None
     assert media.audioChannels == 2
     assert media.audioCodec == "mp3"
@@ -285,8 +362,27 @@ def test_audio_Track_mixins_images(track):
     test_mixins.attr_posterUrl(track)
 
 
+def test_audio_Track_mixins_rating(track):
+    test_mixins.edit_rating(track)
+
+
 def test_audio_Track_mixins_tags(track):
+    test_mixins.edit_collection(track)
     test_mixins.edit_mood(track)
+
+
+def test_audio_Track_media_tags(track):
+    track.reload()
+    test_media.tag_collection(track)
+    test_media.tag_mood(track)
+
+
+def test_audio_Track_PlexWebURL(plex, track):
+    url = track.getWebURL()
+    assert url.startswith('https://app.plex.tv/desktop')
+    assert plex.machineIdentifier in url
+    assert 'details' in url
+    assert quote_plus(track.parentKey) in url
 
 
 def test_audio_Audio_section(artist, album, track):
@@ -296,16 +392,20 @@ def test_audio_Audio_section(artist, album, track):
     assert track.section().key == album.section().key == artist.section().key
 
 
+def test_audio_Artist_download(monkeydownload, tmpdir, artist):
+    total = len(artist.tracks())
+    filepaths = artist.download(savepath=str(tmpdir))
+    assert len(filepaths) == total
+    subfolders = artist.download(savepath=str(tmpdir), subfolders=True)
+    assert len(subfolders) == total
+
+
+def test_audio_Album_download(monkeydownload, tmpdir, album):
+    total = len(album.tracks())
+    filepaths = album.download(savepath=str(tmpdir))
+    assert len(filepaths) == total
+
+
 def test_audio_Track_download(monkeydownload, tmpdir, track):
-    f = track.download(savepath=str(tmpdir))
-    assert f
-
-
-def test_audio_album_download(monkeydownload, album, tmpdir):
-    f = album.download(savepath=str(tmpdir))
-    assert len(f) == 1
-
-
-def test_audio_Artist_download(monkeydownload, artist, tmpdir):
-    f = artist.download(savepath=str(tmpdir))
-    assert len(f) == 1
+    filepaths = track.download(savepath=str(tmpdir))
+    assert len(filepaths) == 1

@@ -15,7 +15,6 @@ from plexapi.library import LibrarySection, Hub
 from plexapi.server import PlexServer
 from plexapi.sonos import PlexSonosClient
 from plexapi.sync import SyncItem, SyncList
-from plexapi.utils import joinArgs
 from requests.status_codes import _codes as codes
 
 
@@ -72,11 +71,9 @@ class MyPlexAccount(PlexObject):
     PLEXSERVERS = 'https://plex.tv/api/servers/{machineId}'                                     # get
     FRIENDUPDATE = 'https://plex.tv/api/friends/{userId}'                                       # put with args, delete
     REMOVEHOMEUSER = 'https://plex.tv/api/home/users/{userId}'                                  # delete
-    REMOVEINVITE = 'https://plex.tv/api/invites/requested/{userId}?friend=1&server=1&home=1'    # delete
-    REQUESTED = 'https://plex.tv/api/invites/requested'                                         # get
-    REQUESTS = 'https://plex.tv/api/invites/requests'                                           # get
     SIGNIN = 'https://plex.tv/users/sign_in.xml'                                                # get with auth
     WEBHOOKS = 'https://plex.tv/api/v2/user/webhooks'                                           # get, post with data
+    OPTOUTS = 'https://plex.tv/api/v2/user/%(userUUID)s/settings/opt_outs'                      # get
     LINK = 'https://plex.tv/api/v2/pins/link'                                                   # put
     # Hub sections
     VOD = 'https://vod.provider.plex.tv/'                                                       # get
@@ -130,26 +127,16 @@ class MyPlexAccount(PlexObject):
         self.title = data.attrib.get('title')
         self.username = data.attrib.get('username')
         self.uuid = data.attrib.get('uuid')
-        subscription = data.find('subscription')
 
+        subscription = data.find('subscription')
         self.subscriptionActive = utils.cast(bool, subscription.attrib.get('active'))
         self.subscriptionStatus = subscription.attrib.get('status')
         self.subscriptionPlan = subscription.attrib.get('plan')
+        self.subscriptionFeatures = self.listAttrs(subscription, 'id', etag='feature')
 
-        self.subscriptionFeatures = []
-        for feature in subscription.iter('feature'):
-            self.subscriptionFeatures.append(feature.attrib.get('id'))
+        self.roles = self.listAttrs(data, 'id', rtag='roles', etag='role')
 
-        roles = data.find('roles')
-        self.roles = []
-        if roles is not None:
-            for role in roles.iter('role'):
-                self.roles.append(role.attrib.get('id'))
-
-        entitlements = data.find('entitlements')
-        self.entitlements = []
-        for entitlement in entitlements.iter('entitlement'):
-            self.entitlements.append(entitlement.attrib.get('id'))
+        self.entitlements = self.listAttrs(data, 'id', rtag='entitlements', etag='entitlement')
 
         # TODO: Fetch missing MyPlexAccount attributes
         self.profile_settings = None
@@ -377,24 +364,53 @@ class MyPlexAccount(PlexObject):
         return self.query(url, self._session.post, headers=headers)
 
     def removeFriend(self, user):
-        """ Remove the specified user from all sharing.
+        """ Remove the specified user from your friends.
 
             Parameters:
-                user (str): MyPlexUser, username, email of the user to be added.
+                user (str): :class:`~plexapi.myplex.MyPlexUser`, username, or email of the user to be removed.
         """
-        user = self.user(user)
-        url = self.FRIENDUPDATE if user.friend else self.REMOVEINVITE
-        url = url.format(userId=user.id)
+        user = user if isinstance(user, MyPlexUser) else self.user(user)
+        url = self.FRIENDUPDATE.format(userId=user.id)
         return self.query(url, self._session.delete)
 
     def removeHomeUser(self, user):
-        """ Remove the specified managed user from home.
+        """ Remove the specified user from your home users.
 
             Parameters:
-                user (str): MyPlexUser, username, email of the user to be removed from home.
+                user (str): :class:`~plexapi.myplex.MyPlexUser`, username, or email of the user to be removed.
         """
-        user = self.user(user)
+        user = user if isinstance(user, MyPlexUser) else self.user(user)
         url = self.REMOVEHOMEUSER.format(userId=user.id)
+        return self.query(url, self._session.delete)
+
+    def acceptInvite(self, user):
+        """ Accept a pending firend invite from the specified user.
+
+            Parameters:
+                user (str): :class:`~plexapi.myplex.MyPlexInvite`, username, or email of the friend invite to accept.
+        """
+        invite = user if isinstance(user, MyPlexInvite) else self.pendingInvite(user, includeSent=False)
+        params = {
+            'friend': int(invite.friend),
+            'home': int(invite.home),
+            'server': int(invite.server)
+        }
+        url = MyPlexInvite.REQUESTS + '/%s' % invite.id + utils.joinArgs(params)
+        return self.query(url, self._session.put)
+
+    def cancelInvite(self, user):
+        """ Cancel a pending firend invite for the specified user.
+
+            Parameters:
+                user (str): :class:`~plexapi.myplex.MyPlexInvite`, username, or email of the friend invite to cancel.
+        """
+        invite = user if isinstance(user, MyPlexInvite) else self.pendingInvite(user, includeReceived=False)
+        params = {
+            'friend': int(invite.friend),
+            'home': int(invite.home),
+            'server': int(invite.server)
+        }
+        url = MyPlexInvite.REQUESTED + '/%s' % invite.id + utils.joinArgs(params)
         return self.query(url, self._session.delete)
 
     def updateFriend(self, user, server, sections=None, removeSections=False, allowSync=None, allowCameraUpload=None,
@@ -462,35 +478,67 @@ class MyPlexAccount(PlexObject):
         if isinstance(allowChannels, dict):
             params['filterMusic'] = self._filterDictToStr(filterMusic or {})
         if params:
-            url += joinArgs(params)
+            url += utils.joinArgs(params)
             response_filters = self.query(url, self._session.put)
         return response_servers, response_filters
 
     def user(self, username):
-        """ Returns the :class:`~plexapi.myplex.MyPlexUser` that matches the email or username specified.
+        """ Returns the :class:`~plexapi.myplex.MyPlexUser` that matches the specified username or email.
 
             Parameters:
                 username (str): Username, email or id of the user to return.
         """
+        username = str(username)
         for user in self.users():
             # Home users don't have email, username etc.
             if username.lower() == user.title.lower():
                 return user
 
             elif (user.username and user.email and user.id and username.lower() in
-                  (user.username.lower(), user.email.lower(), str(user.id))):
+                    (user.username.lower(), user.email.lower(), str(user.id))):
                 return user
 
         raise NotFound('Unable to find user %s' % username)
 
     def users(self):
         """ Returns a list of all :class:`~plexapi.myplex.MyPlexUser` objects connected to your account.
-            This includes both friends and pending invites. You can reference the user.friend to
-            distinguish between the two.
         """
-        friends = [MyPlexUser(self, elem) for elem in self.query(MyPlexUser.key)]
-        requested = [MyPlexUser(self, elem, self.REQUESTED) for elem in self.query(self.REQUESTED)]
-        return friends + requested
+        elem = self.query(MyPlexUser.key)
+        return self.findItems(elem, cls=MyPlexUser)
+
+    def pendingInvite(self, username, includeSent=True, includeReceived=True):
+        """ Returns the :class:`~plexapi.myplex.MyPlexInvite` that matches the specified username or email.
+            Note: This can be a pending invite sent from your account or received to your account.
+
+            Parameters:
+                username (str): Username, email or id of the user to return.
+                includeSent (bool): True to include sent invites.
+                includeReceived (bool): True to include received invites.
+        """
+        username = str(username)
+        for invite in self.pendingInvites(includeSent, includeReceived):
+            if (invite.username and invite.email and invite.id and username.lower() in
+                    (invite.username.lower(), invite.email.lower(), str(invite.id))):
+                return invite
+        
+        raise NotFound('Unable to find invite %s' % username)
+
+    def pendingInvites(self, includeSent=True, includeReceived=True):
+        """ Returns a list of all :class:`~plexapi.myplex.MyPlexInvite` objects connected to your account.
+            Note: This includes all pending invites sent from your account and received to your account.
+
+            Parameters:
+                includeSent (bool): True to include sent invites.
+                includeReceived (bool): True to include received invites.
+        """
+        invites = []
+        if includeSent:
+            elem = self.query(MyPlexInvite.REQUESTED)
+            invites += self.findItems(elem, cls=MyPlexInvite)
+        if includeReceived:
+            elem = self.query(MyPlexInvite.REQUESTS)
+            invites += self.findItems(elem, cls=MyPlexInvite)
+        return invites
 
     def _getSectionIds(self, server, sections):
         """ Converts a list of section objects or names to sectionIds needed for library sharing. """
@@ -501,15 +549,18 @@ class MyPlexAccount(PlexObject):
         url = self.PLEXSERVERS.replace('{machineId}', machineIdentifier)
         data = self.query(url, self._session.get)
         for elem in data[0]:
-            allSectionIds[elem.attrib.get('id', '').lower()] = elem.attrib.get('id')
-            allSectionIds[elem.attrib.get('title', '').lower()] = elem.attrib.get('id')
-            allSectionIds[elem.attrib.get('key', '').lower()] = elem.attrib.get('id')
+            _id = utils.cast(int, elem.attrib.get('id'))
+            _key = utils.cast(int, elem.attrib.get('key'))
+            _title = elem.attrib.get('title', '').lower()
+            allSectionIds[_id] = _id
+            allSectionIds[_key] = _id
+            allSectionIds[_title] = _id
         log.debug(allSectionIds)
         # Convert passed in section items to section ids from above lookup
         sectionIds = []
         for section in sections:
-            sectionKey = section.key if isinstance(section, LibrarySection) else section
-            sectionIds.append(allSectionIds[sectionKey.lower()])
+            sectionKey = section.key if isinstance(section, LibrarySection) else section.lower()
+            sectionIds.append(allSectionIds[sectionKey])
         return sectionIds
 
     def _filterDictToStr(self, filterDict):
@@ -631,9 +682,7 @@ class MyPlexAccount(PlexObject):
         }
 
         url = SyncList.key.format(clientId=client.clientIdentifier)
-        data = self.query(url, method=self._session.post, headers={
-            'Content-type': 'x-www-form-urlencoded',
-        }, params=params)
+        data = self.query(url, method=self._session.post, params=params)
 
         return SyncItem(self, data, None, clientIdentifier=client.clientIdentifier)
 
@@ -710,6 +759,13 @@ class MyPlexAccount(PlexObject):
         elem = ElementTree.fromstring(req.text)
         return self.findItems(elem)
 
+    def onlineMediaSources(self):
+        """ Returns a list of user account Online Media Sources settings :class:`~plexapi.myplex.AccountOptOut`
+        """
+        url = self.OPTOUTS % {'userUUID': self.uuid}
+        elem = self.query(url)
+        return self.findItems(elem, cls=AccountOptOut, etag='optOut')
+
     def link(self, pin):
         """ Link a device to the account using a pin code.
 
@@ -747,10 +803,10 @@ class MyPlexUser(PlexObject):
             protected (False): Unknown (possibly SSL enabled?).
             recommendationsPlaylistId (str): Unknown.
             restricted (str): Unknown.
+            servers (List<:class:`~plexapi.myplex.<MyPlexServerShare`>)): Servers shared with the user.
             thumb (str): Link to the users avatar.
             title (str): Seems to be an aliad for username.
             username (str): User's username.
-            servers: Servers shared between user and friend
     """
     TAG = 'User'
     key = 'https://plex.tv/api/users/'
@@ -812,30 +868,67 @@ class MyPlexUser(PlexObject):
         return hist
 
 
+class MyPlexInvite(PlexObject):
+    """ This object represents pending friend invites.
+
+        Attributes:
+            TAG (str): 'Invite'
+            createdAt (datetime): Datetime the user was invited.
+            email (str): User's email address (user@gmail.com).
+            friend (bool): True or False if the user is invited as a friend.
+            friendlyName (str): The user's friendly name.
+            home (bool): True or False if the user is invited to a Plex Home.
+            id (int): User's Plex account ID.
+            server (bool): True or False if the user is invited to any servers.
+            servers (List<:class:`~plexapi.myplex.<MyPlexServerShare`>)): Servers shared with the user.
+            thumb (str): Link to the users avatar.
+            username (str): User's username.
+    """
+    TAG = 'Invite'
+    REQUESTS = 'https://plex.tv/api/invites/requests'
+    REQUESTED = 'https://plex.tv/api/invites/requested'
+
+    def _loadData(self, data):
+        """ Load attribute values from Plex XML response. """
+        self._data = data
+        self.createdAt = utils.toDatetime(data.attrib.get('createdAt'))
+        self.email = data.attrib.get('email')
+        self.friend = utils.cast(bool, data.attrib.get('friend'))
+        self.friendlyName = data.attrib.get('friendlyName')
+        self.home = utils.cast(bool, data.attrib.get('home'))
+        self.id = utils.cast(int, data.attrib.get('id'))
+        self.server = utils.cast(bool, data.attrib.get('server'))
+        self.servers = self.findItems(data, MyPlexServerShare)
+        self.thumb = data.attrib.get('thumb')
+        self.username = data.attrib.get('username', '')
+        for server in self.servers:
+            server.accountID = self.id
+
+
 class Section(PlexObject):
     """ This refers to a shared section. The raw xml for the data presented here
-        can be found at: https://plex.tv/api/servers/{machineId}/shared_servers/{serverId}
+        can be found at: https://plex.tv/api/servers/{machineId}/shared_servers
 
         Attributes:
             TAG (str): section
-            id (int): shared section id
-            sectionKey (str): what key we use for this section
-            title (str): Title of the section
-            sectionId (str): shared section id
-            type (str): movie, tvshow, artist
+            id (int): The shared section ID
+            key (int): The shared library section key
             shared (bool): If this section is shared with the user
+            title (str): Title of the section
+            type (str): movie, tvshow, artist
 
     """
     TAG = 'Section'
 
     def _loadData(self, data):
         self._data = data
-        # self.id = utils.cast(int, data.attrib.get('id'))  # Havnt decided if this should be changed.
-        self.sectionKey = data.attrib.get('key')
+        self.id = utils.cast(int, data.attrib.get('id'))
+        self.key = utils.cast(int, data.attrib.get('key'))
+        self.shared = utils.cast(bool, data.attrib.get('shared', '0'))
         self.title = data.attrib.get('title')
-        self.sectionId = data.attrib.get('id')
         self.type = data.attrib.get('type')
-        self.shared = utils.cast(bool, data.attrib.get('shared'))
+        self.sectionId = self.id  # For backwards compatibility
+        self.sectionKey = self.key  # For backwards compatibility
 
     def history(self, maxresults=9999999, mindate=None):
         """ Get all Play History for a user for this section in this shared server.
@@ -896,13 +989,7 @@ class MyPlexServerShare(PlexObject):
         """
         url = MyPlexAccount.FRIENDSERVERS.format(machineId=self.machineIdentifier, serverId=self.id)
         data = self._server.query(url)
-        sections = []
-
-        for section in data.iter('Section'):
-            if ElementTree.iselement(section):
-                sections.append(Section(self, section, url))
-
-        return sections
+        return self.findItems(data, Section, rtag='SharedServer')
 
     def history(self, maxresults=9999999, mindate=None):
         """ Get all Play History for a user in this shared server.
@@ -945,6 +1032,10 @@ class MyPlexResource(PlexObject):
     TAG = 'Device'
     key = 'https://plex.tv/api/resources?includeHttps=1&includeRelay=1'
 
+    # Default order to prioritize available resource connections
+    DEFAULT_LOCATION_ORDER = ['local', 'remote', 'relay']
+    DEFAULT_SCHEME_ORDER = ['https', 'http']
+
     def _loadData(self, data):
         self._data = data
         self.name = data.attrib.get('name')
@@ -969,10 +1060,51 @@ class MyPlexResource(PlexObject):
         self.ownerid = utils.cast(int, data.attrib.get('ownerId', 0))
         self.sourceTitle = data.attrib.get('sourceTitle')  # owners plex username.
 
-    def connect(self, ssl=None, timeout=None):
-        """ Returns a new :class:`~plexapi.server.PlexServer` or :class:`~plexapi.client.PlexClient` object.
+    def preferred_connections(
+        self,
+        ssl=None,
+        timeout=None,
+        locations=DEFAULT_LOCATION_ORDER,
+        schemes=DEFAULT_SCHEME_ORDER,
+    ):
+        """ Returns a sorted list of the available connection addresses for this resource.
             Often times there is more than one address specified for a server or client.
-            This function will prioritize local connections before remote or relay and HTTPS before HTTP.
+            Default behavior will prioritize local connections before remote or relay and HTTPS before HTTP.
+
+            Parameters:
+                ssl (bool, optional): Set True to only connect to HTTPS connections. Set False to
+                    only connect to HTTP connections. Set None (default) to connect to any
+                    HTTP or HTTPS connection.
+                timeout (int, optional): The timeout in seconds to attempt each connection.
+        """
+        connections_dict = {location: {scheme: [] for scheme in schemes} for location in locations}
+        for connection in self.connections:
+            # Only check non-local connections unless we own the resource
+            if self.owned or (not self.owned and not connection.local):
+                location = 'relay' if connection.relay else ('local' if connection.local else 'remote')
+                if location not in locations:
+                    continue
+                if 'http' in schemes:
+                    connections_dict[location]['http'].append(connection.httpuri)
+                if 'https' in schemes:
+                    connections_dict[location]['https'].append(connection.uri)
+        if ssl is True: schemes.remove('http')
+        elif ssl is False: schemes.remove('https')
+        connections = []
+        for location in locations:
+            for scheme in schemes:
+                connections.extend(connections_dict[location][scheme])
+        return connections
+
+    def connect(
+        self,
+        ssl=None,
+        timeout=None,
+        locations=DEFAULT_LOCATION_ORDER,
+        schemes=DEFAULT_SCHEME_ORDER,
+    ):
+        """ Returns a new :class:`~plexapi.server.PlexServer` or :class:`~plexapi.client.PlexClient` object.
+            Uses `MyPlexResource.preferred_connections()` to generate the priority order of connection addresses.
             After trying to connect to all available addresses for this resource and
             assuming at least one connection was successful, the PlexServer object is built and returned.
 
@@ -985,22 +1117,7 @@ class MyPlexResource(PlexObject):
             Raises:
                 :exc:`~plexapi.exceptions.NotFound`: When unable to connect to any addresses for this resource.
         """
-        # Keys in the order we want the connections to be sorted
-        locations = ['local', 'remote', 'relay']
-        schemes = ['https', 'http']
-        connections_dict = {location: {scheme: [] for scheme in schemes} for location in locations}
-        for connection in self.connections:
-            # Only check non-local connections unless we own the resource
-            if self.owned or (not self.owned and not connection.local):
-                location = 'relay' if connection.relay else ('local' if connection.local else 'remote')
-                connections_dict[location]['http'].append(connection.httpuri)
-                connections_dict[location]['https'].append(connection.uri)
-        if ssl is True: schemes.remove('http')
-        elif ssl is False: schemes.remove('https')
-        connections = []
-        for location in locations:
-            for scheme in schemes:
-                connections.extend(connections_dict[location][scheme])
+        connections = self.preferred_connections(ssl, timeout, locations, schemes)
         # Try connecting to all known resource connections in parellel, but
         # only return the first server (in order) that provides a response.
         cls = PlexServer if 'server' in self.provides else PlexClient
@@ -1087,7 +1204,7 @@ class MyPlexDevice(PlexObject):
         self.screenDensity = data.attrib.get('screenDensity')
         self.createdAt = utils.toDatetime(data.attrib.get('createdAt'))
         self.lastSeenAt = utils.toDatetime(data.attrib.get('lastSeenAt'))
-        self.connections = [connection.attrib.get('uri') for connection in data.iter('Connection')]
+        self.connections = self.listAttrs(data, 'uri', etag='Connection')
 
     def connect(self, timeout=None):
         """ Returns a new :class:`~plexapi.client.PlexClient` or :class:`~plexapi.server.PlexServer`
@@ -1353,3 +1470,54 @@ def _chooseConnection(ctype, name, results):
         log.debug('Connecting to %s: %s?X-Plex-Token=%s', ctype, results[0]._baseurl, results[0]._token)
         return results[0]
     raise NotFound('Unable to connect to %s: %s' % (ctype.lower(), name))
+
+
+class AccountOptOut(PlexObject):
+    """ Represents a single AccountOptOut
+        'https://plex.tv/api/v2/user/{userUUID}/settings/opt_outs'
+
+        Attributes:
+            TAG (str): optOut
+            key (str): Online Media Source key
+            value (str): Online Media Source opt_in, opt_out, or opt_out_managed
+    """
+    TAG = 'optOut'
+    CHOICES = {'opt_in', 'opt_out', 'opt_out_managed'}
+
+    def _loadData(self, data):
+        self.key = data.attrib.get('key')
+        self.value = data.attrib.get('value')
+
+    def _updateOptOut(self, option):
+        """ Sets the Online Media Sources option.
+
+            Parameters:
+                option (str): see CHOICES
+
+            Raises:
+                :exc:`~plexapi.exceptions.NotFound`: ``option`` str not found in CHOICES.
+        """
+        if option not in self.CHOICES:
+            raise NotFound('%s not found in available choices: %s' % (option, self.CHOICES))
+        url = self._server.OPTOUTS % {'userUUID': self._server.uuid}
+        params = {'key': self.key, 'value': option}
+        self._server.query(url, method=self._server._session.post, params=params)
+        self.value = option  # assume query successful and set the value to option
+
+    def optIn(self):
+        """ Sets the Online Media Source to "Enabled". """
+        self._updateOptOut('opt_in')
+
+    def optOut(self):
+        """ Sets the Online Media Source to "Disabled". """
+        self._updateOptOut('opt_out')
+
+    def optOutManaged(self):
+        """ Sets the Online Media Source to "Disabled for Managed Users".
+        
+            Raises:
+                :exc:`~plexapi.exceptions.BadRequest`: When trying to opt out music.
+        """
+        if self.key == 'tv.plex.provider.music':
+            raise BadRequest('%s does not have the option to opt out managed users.' % self.key)
+        self._updateOptOut('opt_out_managed')

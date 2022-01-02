@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-from urllib.parse import quote, quote_plus, unquote, urlencode
+import re
+from datetime import datetime
+from urllib.parse import quote, quote_plus, urlencode
 
 from plexapi import X_PLEX_CONTAINER_SIZE, log, media, utils
 from plexapi.base import OPERATORS, PlexObject
@@ -24,47 +26,61 @@ class Library(PlexObject):
 
     def _loadData(self, data):
         self._data = data
-        self._sectionsByID = {}  # cached Section UUIDs
         self.identifier = data.attrib.get('identifier')
         self.mediaTagVersion = data.attrib.get('mediaTagVersion')
         self.title1 = data.attrib.get('title1')
         self.title2 = data.attrib.get('title2')
+        self._sectionsByID = {}  # cached sections by key
+        self._sectionsByTitle = {}  # cached sections by title
+
+    def _loadSections(self):
+        """ Loads and caches all the library sections. """
+        key = '/library/sections'
+        self._sectionsByID = {}
+        self._sectionsByTitle = {}
+        for elem in self._server.query(key):
+            for cls in (MovieSection, ShowSection, MusicSection, PhotoSection):
+                if elem.attrib.get('type') == cls.TYPE:
+                    section = cls(self._server, elem, key)
+                    self._sectionsByID[section.key] = section
+                    self._sectionsByTitle[section.title.lower()] = section
 
     def sections(self):
         """ Returns a list of all media sections in this library. Library sections may be any of
             :class:`~plexapi.library.MovieSection`, :class:`~plexapi.library.ShowSection`,
             :class:`~plexapi.library.MusicSection`, :class:`~plexapi.library.PhotoSection`.
         """
-        key = '/library/sections'
-        sections = []
-        for elem in self._server.query(key):
-            for cls in (MovieSection, ShowSection, MusicSection, PhotoSection):
-                if elem.attrib.get('type') == cls.TYPE:
-                    section = cls(self._server, elem, key)
-                    self._sectionsByID[section.key] = section
-                    sections.append(section)
-        return sections
+        self._loadSections()
+        return list(self._sectionsByID.values())
 
-    def section(self, title=None):
+    def section(self, title):
         """ Returns the :class:`~plexapi.library.LibrarySection` that matches the specified title.
 
             Parameters:
                 title (str): Title of the section to return.
         """
-        for section in self.sections():
-            if section.title.lower() == title.lower():
-                return section
-        raise NotFound('Invalid library section: %s' % title)
+        if not self._sectionsByTitle or title not in self._sectionsByTitle:
+            self._loadSections()
+        try:
+            return self._sectionsByTitle[title.lower()]
+        except KeyError:
+            raise NotFound('Invalid library section: %s' % title) from None
 
     def sectionByID(self, sectionID):
         """ Returns the :class:`~plexapi.library.LibrarySection` that matches the specified sectionID.
 
             Parameters:
-                sectionID (str): ID of the section to return.
+                sectionID (int): ID of the section to return.
+
+            Raises:
+                :exc:`~plexapi.exceptions.NotFound`: The library section ID is not found on the server.
         """
         if not self._sectionsByID or sectionID not in self._sectionsByID:
-            self.sections()
-        return self._sectionsByID[sectionID]
+            self._loadSections()
+        try:
+            return self._sectionsByID[sectionID]
+        except KeyError:
+            raise NotFound('Invalid library sectionID: %s' % sectionID) from None
 
     def all(self, **kwargs):
         """ Returns a list of all media from all library sections.
@@ -217,7 +233,7 @@ class Library(PlexObject):
             **Show Preferences**
 
                 * **agent** (str): com.plexapp.agents.none, com.plexapp.agents.thetvdb, com.plexapp.agents.themoviedb,
-                  tv.plex.agent.series
+                  tv.plex.agents.series
                 * **enableBIFGeneration** (bool): Enable video preview thumbnails. Default value true.
                 * **episodeSort** (int): Episode order. Default -1 Possible options: 0:Oldest first, 1:Newest first.
                 * **flattenSeasons** (int): Seasons. Default value 0 Possible options: 0:Show,1:Hide.
@@ -319,8 +335,8 @@ class LibrarySection(PlexObject):
             art (str): Background artwork used to respresent the library section.
             composite (str): Composite image used to represent the library section.
             createdAt (datetime): Datetime the library section was created.
-            filters (str): Unknown
-            key (str): Key (or ID) of this library section.
+            filters (bool): True if filters are available for the library section.
+            key (int): Key (or ID) of this library section.
             language (str): Language represented in this section (en, xn, etc).
             locations (List<str>): List of folder paths added to the library section.
             refreshing (bool): True if this section is currently being refreshed.
@@ -339,8 +355,8 @@ class LibrarySection(PlexObject):
         self.art = data.attrib.get('art')
         self.composite = data.attrib.get('composite')
         self.createdAt = utils.toDatetime(data.attrib.get('createdAt'))
-        self.filters = data.attrib.get('filters')
-        self.key = data.attrib.get('key')  # invalid key from plex
+        self.filters = utils.cast(bool, data.attrib.get('filters'))
+        self.key = utils.cast(int, data.attrib.get('key'))
         self.language = data.attrib.get('language')
         self.locations = self.listAttrs(data, 'path', etag='Location')
         self.refreshing = utils.cast(bool, data.attrib.get('refreshing'))
@@ -351,7 +367,12 @@ class LibrarySection(PlexObject):
         self.updatedAt = utils.toDatetime(data.attrib.get('updatedAt'))
         self.uuid = data.attrib.get('uuid')
         # Private attrs as we dont want a reload.
-        self._total_size = None
+        self._filterTypes = None
+        self._fieldTypes = None
+        self._totalViewSize = None
+        self._totalSize = None
+        self._totalDuration = None
+        self._totalStorage = None
 
     def fetchItems(self, ekey, cls=None, container_start=None, container_size=None, **kwargs):
         """ Load the specified key to find and build all items with the specified tag
@@ -377,11 +398,11 @@ class LibrarySection(PlexObject):
             # totalSize is only included in the xml response
             # if container size is used.
             total_size = data.attrib.get("totalSize") or data.attrib.get("size")
-            self._total_size = utils.cast(int, total_size)
+            self._totalViewSize = utils.cast(int, total_size)
 
         items = self.findItems(data, cls, ekey, **kwargs)
 
-        librarySectionID = data.attrib.get('librarySectionID')
+        librarySectionID = utils.cast(int, data.attrib.get('librarySectionID'))
         if librarySectionID:
             for item in items:
                 item.librarySectionID = librarySectionID
@@ -389,13 +410,63 @@ class LibrarySection(PlexObject):
 
     @property
     def totalSize(self):
-        """ Returns the total number of items in the library. """
-        if self._total_size is None:
-            part = '/library/sections/%s/all?X-Plex-Container-Start=0&X-Plex-Container-Size=1' % self.key
-            data = self._server.query(part)
-            self._total_size = int(data.attrib.get("totalSize"))
+        """ Returns the total number of items in the library for the default library type. """
+        if self._totalSize is None:
+            self._totalSize = self.totalViewSize(includeCollections=False)
+        return self._totalSize
 
-        return self._total_size
+    @property
+    def totalDuration(self):
+        """ Returns the total duration (in milliseconds) of items in the library. """
+        if self._totalDuration is None:
+            self._getTotalDurationStorage()
+        return self._totalDuration
+
+    @property
+    def totalStorage(self):
+        """ Returns the total storage (in bytes) of items in the library. """
+        if self._totalStorage is None:
+            self._getTotalDurationStorage()
+        return self._totalStorage
+
+    def _getTotalDurationStorage(self):
+        """ Queries the Plex server for the total library duration and storage and caches the values. """
+        data = self._server.query('/media/providers?includeStorage=1')
+        xpath = (
+            './MediaProvider[@identifier="com.plexapp.plugins.library"]'
+            '/Feature[@type="content"]'
+            '/Directory[@id="%s"]'
+        ) % self.key
+        directory = next(iter(data.findall(xpath)), None)
+        if directory:
+            self._totalDuration = utils.cast(int, directory.attrib.get('durationTotal'))
+            self._totalStorage = utils.cast(int, directory.attrib.get('storageTotal'))
+
+    def totalViewSize(self, libtype=None, includeCollections=True):
+        """ Returns the total number of items in the library for a specified libtype.
+            The number of items for the default library type will be returned if no libtype is specified.
+            (e.g. Specify ``libtype='episode'`` for the total number of episodes
+            or ``libtype='albums'`` for the total number of albums.)
+
+            Parameters:
+                libtype (str, optional): The type of items to return the total number for (movie, show, season, episode,
+                    artist, album, track, photoalbum). Default is the main library type.
+                includeCollections (bool, optional): True or False to include collections in the total number.
+                    Default is True.
+        """
+        args = {
+            'includeCollections': int(bool(includeCollections)),
+            'X-Plex-Container-Start': 0,
+            'X-Plex-Container-Size': 0
+        }
+        if libtype is not None:
+            if libtype == 'photo':
+                args['clusterZoomLevel'] = 1
+            else:
+                args['type'] = utils.searchType(libtype)
+        part = '/library/sections/%s/all%s' % (self.key, utils.joinArgs(args))
+        data = self._server.query(part)
+        return utils.cast(int, data.attrib.get("totalSize"))
 
     def delete(self):
         """ Delete a library section. """
@@ -407,8 +478,12 @@ class LibrarySection(PlexObject):
             log.error(msg)
             raise
 
-    def reload(self, key=None):
-        return self._server.library.section(self.title)
+    def reload(self):
+        """ Reload the data for the library section. """
+        self._server.library._loadSections()
+        newLibrary = self._server.library.sectionByID(self.key)
+        self.__dict__.update(newLibrary.__dict__)
+        return self
 
     def edit(self, agent=None, **kwargs):
         """ Edit a library (Note: agent is required). See :class:`~plexapi.library.Library` for example usage.
@@ -421,23 +496,53 @@ class LibrarySection(PlexObject):
         part = '/library/sections/%s?agent=%s&%s' % (self.key, agent, urlencode(kwargs))
         self._server.query(part, method=self._server._session.put)
 
-        # Reload this way since the self.key dont have a full path, but is simply a id.
-        for s in self._server.library.sections():
-            if s.key == self.key:
-                return s
-
     def get(self, title):
         """ Returns the media item with the specified title.
 
             Parameters:
                 title (str): Title of the item to return.
+
+            Raises:
+                :exc:`~plexapi.exceptions.NotFound`: The title is not found in the library.
         """
-        key = '/library/sections/%s/all?title=%s' % (self.key, quote(title, safe=''))
+        key = '/library/sections/%s/all?includeGuids=1&title=%s' % (self.key, quote(title, safe=''))
         return self.fetchItem(key, title__iexact=title)
+
+    def getGuid(self, guid):
+        """ Returns the media item with the specified external IMDB, TMDB, or TVDB ID.
+            Note: This search uses a PlexAPI operator so performance may be slow. All items from the
+            entire Plex library need to be retrieved for each guid search. It is recommended to create
+            your own lookup dictionary if you are searching for a lot of external guids.
+
+            Parameters:
+                guid (str): The external guid of the item to return.
+                    Examples: IMDB ``imdb://tt0944947``, TMDB ``tmdb://1399``, TVDB ``tvdb://121361``.
+
+            Raises:
+                :exc:`~plexapi.exceptions.NotFound`: The guid is not found in the library.
+
+            Example:
+
+                .. code-block:: python
+
+                    # This will retrieve all items in the entire library 3 times
+                    result1 = library.getGuid('imdb://tt0944947')
+                    result2 = library.getGuid('tmdb://1399')
+                    result3 = library.getGuid('tvdb://121361')
+
+                    # This will only retrieve all items in the library once to create a lookup dictionary
+                    guidLookup = {guid.id: item for item in library.all() for guid in item.guids}
+                    result1 = guidLookup['imdb://tt0944947']
+                    result2 = guidLookup['tmdb://1399']
+                    result3 = guidLookup['tvdb://121361']
+
+        """
+        key = '/library/sections/%s/all?includeGuids=1' % self.key
+        return self.fetchItem(key, Guid__id__iexact=guid)
 
     def all(self, libtype=None, **kwargs):
         """ Returns a list of all items from this library section.
-            See description of :func:`plexapi.library.LibrarySection.search()` for details about filtering / sorting.
+            See description of :func:`~plexapi.library.LibrarySection.search()` for details about filtering / sorting.
         """
         libtype = libtype or self.TYPE
         return self.search(libtype=libtype, **kwargs)
@@ -453,40 +558,6 @@ class LibrarySection(PlexObject):
         """
         key = '/hubs/sections/%s' % self.key
         return self.fetchItems(key)
-
-    def _filters(self):
-        """ Returns a list of :class:`~plexapi.library.Filter` from this library section. """
-        key = '/library/sections/%s/filters' % self.key
-        return self.fetchItems(key, cls=Filter)
-
-    def _sorts(self, mediaType=None):
-        """ Returns a list of available :class:`~plexapi.library.Sort` for this library section.
-        """
-        items = []
-        for data in self.listChoices('sorts', mediaType):
-            sort = Sort(server=self._server, data=data._data)
-            sort._initpath = data._initpath
-            items.append(sort)
-        return items
-
-    def filterFields(self, mediaType=None):
-        """ Returns a list of available :class:`~plexapi.library.FilterField` for this library section.
-        """
-        items = []
-        key = '/library/sections/%s/filters?includeMeta=1' % self.key
-        data = self._server.query(key)
-        for meta in data.iter('Meta'):
-            for metaType in meta.iter('Type'):
-                if not mediaType or metaType.attrib.get('type') == mediaType:
-                    fields = self.findItems(metaType, FilterField)
-                    for field in fields:
-                        field._initpath = metaType.attrib.get('key')
-                        fieldType = [_ for _ in self.findItems(meta, FieldType) if _.type == field.type]
-                        field.operators = fieldType[0].operators
-                    items += fields
-        if not items and mediaType:
-            raise BadRequest('mediaType (%s) not found.' % mediaType)
-        return items
 
     def agents(self):
         """ Returns a list of available :class:`~plexapi.media.Agent` for this library section.
@@ -513,11 +584,10 @@ class LibrarySection(PlexObject):
 
         for settingID, value in kwargs.items():
             try:
-                enums = idEnums.get(settingID)
-                enumValues = [int(x) for x in enums]
-            except TypeError:
+                enums = idEnums[settingID]
+            except KeyError:
                 raise NotFound('%s not found in %s' % (value, list(idEnums.keys())))
-            if value in enumValues:
+            if value in enums:
                 data[key % settingID] = value
             else:
                 raise NotFound('%s not found in %s' % (value, enums))
@@ -547,13 +617,16 @@ class LibrarySection(PlexObject):
         key = '/library/sections/%s/onDeck' % self.key
         return self.fetchItems(key)
 
-    def recentlyAdded(self, maxresults=50):
+    def recentlyAdded(self, maxresults=50, libtype=None):
         """ Returns a list of media items recently added from this library section.
 
             Parameters:
                 maxresults (int): Max number of items to return (default 50).
+                libtype (str, optional): The library type to filter (movie, show, season, episode,
+                    artist, album, track, photoalbum, photo). Default is the main library type.
         """
-        return self.search(sort='addedAt:desc', maxresults=maxresults)
+        libtype = libtype or self.TYPE
+        return self.search(sort='addedAt:desc', maxresults=maxresults, libtype=libtype)
 
     def firstCharacter(self):
         key = '/library/sections/%s/firstCharacter' % self.key
@@ -601,101 +674,708 @@ class LibrarySection(PlexObject):
         key = '/library/sections/%s/indexes' % self.key
         self._server.query(key, method=self._server._session.delete)
 
-    def listChoices(self, category, libtype=None, **kwargs):
-        """ Returns a list of :class:`~plexapi.library.FilterChoice` objects for the
-            specified category and libtype. kwargs can be any of the same kwargs in
-            :func:`~plexapi.library.LibraySection.search` to help narrow down the choices
-            to only those that matter in your current context.
+    def _loadFilters(self):
+        """ Retrieves and caches the list of :class:`~plexapi.library.FilteringType` and
+            list of :class:`~plexapi.library.FilteringFieldType` for this library section.
+        """
+        _key = ('/library/sections/%s/%s?includeMeta=1&includeAdvanced=1'
+               '&X-Plex-Container-Start=0&X-Plex-Container-Size=0')
+               
+        key = _key % (self.key, 'all')
+        data = self._server.query(key)
+        self._filterTypes = self.findItems(data, FilteringType, rtag='Meta')
+        self._fieldTypes = self.findItems(data, FilteringFieldType, rtag='Meta')
+
+        if self.TYPE != 'photo':  # No collections for photo library
+            key = _key % (self.key, 'collections')
+            data = self._server.query(key)
+            self._filterTypes.extend(self.findItems(data, FilteringType, rtag='Meta'))
+
+    def filterTypes(self):
+        """ Returns a list of available :class:`~plexapi.library.FilteringType` for this library section. """
+        if self._filterTypes is None:
+            self._loadFilters()
+        return self._filterTypes
+
+    def getFilterType(self, libtype=None):
+        """ Returns a :class:`~plexapi.library.FilteringType` for a specified libtype.
 
             Parameters:
-                category (str): Category to list choices for (genre, contentRating, etc).
-                libtype (int): Library type of item filter.
-                **kwargs (dict): Additional kwargs to narrow down the choices.
+                libtype (str, optional): The library type to filter (movie, show, season, episode,
+                    artist, album, track, photoalbum, photo, collection).
 
             Raises:
-                :exc:`~plexapi.exceptions.BadRequest`: Cannot include kwarg equal to specified category.
+                :exc:`~plexapi.exceptions.NotFound`: Unknown libtype for this library.
         """
-        # TODO: Should this be moved to base?
-        if category in kwargs:
-            raise BadRequest('Cannot include kwarg equal to specified category: %s' % category)
-        args = {}
-        for subcategory, value in kwargs.items():
-            args[category] = self._cleanSearchFilter(subcategory, value)
-        if libtype is not None:
-            args['type'] = utils.searchType(libtype)
-        key = '/library/sections/%s/%s%s' % (self.key, category, utils.joinArgs(args))
-        return self.fetchItems(key, cls=FilterChoice)
+        libtype = libtype or self.TYPE
+        try:
+            return next(f for f in self.filterTypes() if f.type == libtype)
+        except StopIteration:
+            availableLibtypes = [f.type for f in self.filterTypes()]
+            raise NotFound('Unknown libtype "%s" for this library. '
+                           'Available libtypes: %s'
+                           % (libtype, availableLibtypes)) from None
 
-    def search(self, title=None, sort=None, maxresults=None,
-               libtype=None, container_start=0, container_size=X_PLEX_CONTAINER_SIZE, **kwargs):
-        """ Search the library. The http requests will be batched in container_size. If you're only looking for the first <num>
-            results, it would be wise to set the maxresults option to that amount so this functions
-            doesn't iterate over all results on the server.
+    def fieldTypes(self):
+        """ Returns a list of available :class:`~plexapi.library.FilteringFieldType` for this library section. """
+        if self._fieldTypes is None:
+            self._loadFilters()
+        return self._fieldTypes
+
+    def getFieldType(self, fieldType):
+        """ Returns a :class:`~plexapi.library.FilteringFieldType` for a specified fieldType.
+        
+            Parameters:
+                fieldType (str): The data type for the field (tag, integer, string, boolean, date,
+                    subtitleLanguage, audioLanguage, resolution).
+
+            Raises:
+                :exc:`~plexapi.exceptions.NotFound`: Unknown fieldType for this library.
+        """
+        try:
+            return next(f for f in self.fieldTypes() if f.type == fieldType)
+        except StopIteration:
+            availableFieldTypes = [f.type for f in self.fieldTypes()]
+            raise NotFound('Unknown field type "%s" for this library. '
+                           'Available field types: %s'
+                           % (fieldType, availableFieldTypes)) from None
+
+    def listFilters(self, libtype=None):
+        """ Returns a list of available :class:`~plexapi.library.FilteringFilter` for a specified libtype.
+            This is the list of options in the filter dropdown menu
+            (`screenshot <../_static/images/LibrarySection.listFilters.png>`__).
 
             Parameters:
-                title (str): General string query to search for (optional).
-                sort (str): column:dir; column can be any of {addedAt, originallyAvailableAt, lastViewedAt,
-                      titleSort, rating, mediaHeight, duration}. dir can be asc or desc (optional).
-                maxresults (int): Only return the specified number of results (optional).
-                libtype (str): Filter results to a spcifiec libtype (movie, show, episode, artist,
-                    album, track; optional).
-                container_start (int): default 0
-                container_size (int): default X_PLEX_CONTAINER_SIZE in your config file.
-                **kwargs (dict): Any of the available filters for the current library section. Partial string
-                        matches allowed. Multiple matches OR together. Negative filtering also possible, just add an
-                        exclamation mark to the end of filter name, e.g. `resolution!=1x1`.
+                libtype (str, optional): The library type to filter (movie, show, season, episode,
+                    artist, album, track, photoalbum, photo, collection).
 
-                        * unwatched: Display or hide unwatched content (True, False). [all]
-                        * duplicate: Display or hide duplicate items (True, False). [movie]
-                        * actor: List of actors to search ([actor_or_id, ...]). [movie]
-                        * collection: List of collections to search within ([collection_or_id, ...]). [all]
-                        * contentRating: List of content ratings to search within ([rating_or_key, ...]). [movie,tv]
-                        * country: List of countries to search within ([country_or_key, ...]). [movie,music]
-                        * decade: List of decades to search within ([yyy0, ...]). [movie]
-                        * director: List of directors to search ([director_or_id, ...]). [movie]
-                        * genre: List Genres to search within ([genere_or_id, ...]). [all]
-                        * network: List of TV networks to search within ([resolution_or_key, ...]). [tv]
-                        * resolution: List of video resolutions to search within ([resolution_or_key, ...]). [movie]
-                        * studio: List of studios to search within ([studio_or_key, ...]). [music]
-                        * year: List of years to search within ([yyyy, ...]). [all]
+            Example:
+
+                .. code-block:: python
+
+                    availableFilters = [f.filter for f in library.listFilters()]
+                    print("Available filter fields:", availableFilters)
+
+        """
+        return self.getFilterType(libtype).filters
+        
+    def listSorts(self, libtype=None):
+        """ Returns a list of available :class:`~plexapi.library.FilteringSort` for a specified libtype.
+            This is the list of options in the sorting dropdown menu
+            (`screenshot <../_static/images/LibrarySection.listSorts.png>`__).
+
+            Parameters:
+                libtype (str, optional): The library type to filter (movie, show, season, episode,
+                    artist, album, track, photoalbum, photo, collection).
+
+            Example:
+
+                .. code-block:: python
+
+                    availableSorts = [f.key for f in library.listSorts()]
+                    print("Available sort fields:", availableSorts)
+
+        """
+        return self.getFilterType(libtype).sorts
+
+    def listFields(self, libtype=None):
+        """ Returns a list of available :class:`~plexapi.library.FilteringFields` for a specified libtype.
+            This is the list of options in the custom filter dropdown menu
+            (`screenshot <../_static/images/LibrarySection.search.png>`__).
+
+            Parameters:
+                libtype (str, optional): The library type to filter (movie, show, season, episode,
+                    artist, album, track, photoalbum, photo, collection).
+
+            Example:
+
+                .. code-block:: python
+
+                    availableFields = [f.key.split('.')[-1] for f in library.listFields()]
+                    print("Available fields:", availableFields)
+
+        """
+        return self.getFilterType(libtype).fields
+
+    def listOperators(self, fieldType):
+        """ Returns a list of available :class:`~plexapi.library.FilteringOperator` for a specified fieldType.
+            This is the list of options in the custom filter operator dropdown menu
+            (`screenshot <../_static/images/LibrarySection.search.png>`__).
+        
+            Parameters:
+                fieldType (str): The data type for the field (tag, integer, string, boolean, date,
+                    subtitleLanguage, audioLanguage, resolution).
+
+            Example:
+
+                .. code-block:: python
+
+                    field = 'genre'  # Available filter field from listFields()
+                    filterField = next(f for f in library.listFields() if f.key.endswith(field))
+                    availableOperators = [o.key for o in library.listOperators(filterField.type)]
+                    print("Available operators for %s:" % field, availableOperators)
+
+        """
+        return self.getFieldType(fieldType).operators
+
+    def listFilterChoices(self, field, libtype=None):
+        """ Returns a list of available :class:`~plexapi.library.FilterChoice` for a specified
+            :class:`~plexapi.library.FilteringFilter` or filter field.
+            This is the list of available values for a custom filter
+            (`screenshot <../_static/images/LibrarySection.search.png>`__).
+            
+            Parameters:
+                field (str): :class:`~plexapi.library.FilteringFilter` object,
+                    or the name of the field (genre, year, contentRating, etc.).
+                libtype (str, optional): The library type to filter (movie, show, season, episode,
+                    artist, album, track, photoalbum, photo, collection).
 
             Raises:
-                :exc:`~plexapi.exceptions.BadRequest`: When applying an unknown filter.
+                :exc:`~plexapi.exceptions.BadRequest`: Invalid filter field.
+                :exc:`~plexapi.exceptions.NotFound`: Unknown filter field.
+
+            Example:
+
+                .. code-block:: python
+
+                    field = 'genre'  # Available filter field from listFilters()
+                    availableChoices = [f.title for f in library.listFilterChoices(field)]
+                    print("Available choices for %s:" % field, availableChoices)
+
         """
-        # cleanup the core arguments
+        if isinstance(field, str):
+            match = re.match(r'(?:([a-zA-Z]*)\.)?([a-zA-Z]+)', field)
+            if not match:
+                raise BadRequest('Invalid filter field: %s' % field)
+            _libtype, field = match.groups()
+            libtype = _libtype or libtype or self.TYPE
+            try:
+                field = next(f for f in self.listFilters(libtype) if f.filter == field)
+            except StopIteration:
+                availableFilters = [f.filter for f in self.listFilters(libtype)]
+                raise NotFound('Unknown filter field "%s" for libtype "%s". '
+                               'Available filters: %s'
+                               % (field, libtype, availableFilters)) from None
+                
+        data = self._server.query(field.key)
+        return self.findItems(data, FilterChoice)
+
+    def _validateFilterField(self, field, values, libtype=None):
+        """ Validates a filter field and values are available as a custom filter for the library.
+            Returns the validated field and values as a URL encoded parameter string.
+        """
+        match = re.match(r'(?:([a-zA-Z]*)\.)?([a-zA-Z]+)([!<>=&]*)', field)
+        if not match:
+            raise BadRequest('Invalid filter field: %s' % field)
+        _libtype, field, operator = match.groups()
+        libtype = _libtype or libtype or self.TYPE
+
+        try:
+            filterField = next(f for f in self.listFields(libtype) if f.key.split('.')[-1] == field)
+        except StopIteration:
+            for filterType in reversed(self.filterTypes()):
+                if filterType.type != libtype:
+                    filterField = next((f for f in filterType.fields if f.key.split('.')[-1] == field), None)
+                    if filterField:
+                        break
+            else:
+                availableFields = [f.key for f in self.listFields(libtype)]
+                raise NotFound('Unknown filter field "%s" for libtype "%s". '
+                               'Available filter fields: %s'
+                               % (field, libtype, availableFields)) from None
+
+        field = filterField.key
+        operator = self._validateFieldOperator(filterField, operator)
+        result = self._validateFieldValue(filterField, values, libtype)
+
+        if operator == '&=':
+            args = {field: result}
+            return urlencode(args, doseq=True)
+        else:
+            args = {field + operator[:-1]: ','.join(result)}
+            return urlencode(args)
+
+    def _validateFieldOperator(self, filterField, operator):
+        """ Validates filter operator is in the available operators.
+            Returns the validated operator string.
+        """
+        fieldType = self.getFieldType(filterField.type)
+
+        and_operator = False
+        if operator in {'&', '&='}:
+            and_operator = True
+            operator = ''
+        if fieldType.type == 'string' and operator in {'=', '!='}:
+            operator += '='
+        operator = (operator[:-1] if operator[-1:] == '=' else operator) + '='
+
+        try:
+            next(o for o in fieldType.operators if o.key == operator)
+        except StopIteration:
+            availableOperators = [o.key for o in self.listOperators(filterField.type)]
+            raise NotFound('Unknown operator "%s" for filter field "%s". '
+                           'Available operators: %s'
+                           % (operator, filterField.key, availableOperators)) from None
+
+        return '&=' if and_operator else operator
+
+    def _validateFieldValue(self, filterField, values, libtype=None):
+        """ Validates filter values are the correct datatype and in the available filter choices.
+            Returns the validated list of values.
+        """
+        if not isinstance(values, (list, tuple)):
+            values = [values]
+
+        fieldType = self.getFieldType(filterField.type)
+        results = []
+
+        try:
+            for value in values:
+                if fieldType.type == 'boolean':
+                    value = int(bool(value))
+                elif fieldType.type == 'date':
+                    value = self._validateFieldValueDate(value)
+                elif fieldType.type == 'integer':
+                    value = float(value) if '.' in str(value) else int(value)
+                elif fieldType.type == 'string':
+                    value = str(value)
+                elif fieldType.type in {'tag', 'subtitleLanguage', 'audioLanguage', 'resolution'}:
+                    value = self._validateFieldValueTag(value, filterField, libtype)
+                results.append(str(value))
+        except (ValueError, AttributeError):
+            raise BadRequest('Invalid value "%s" for filter field "%s", value should be type %s'
+                             % (value, filterField.key, fieldType.type)) from None
+    
+        return results
+
+    def _validateFieldValueDate(self, value):
+        """ Validates a filter date value. A filter date value can be a datetime object,
+            a relative date (e.g. -30d), or a date in YYYY-MM-DD format.
+        """
+        if isinstance(value, datetime):
+            return int(value.timestamp())
+        elif re.match(r'^-?\d+(mon|[smhdwy])$', value):
+            return '-' + value.lstrip('-')
+        else:
+            return int(utils.toDatetime(value, '%Y-%m-%d').timestamp())
+
+    def _validateFieldValueTag(self, value, filterField, libtype):
+        """ Validates a filter tag value. A filter tag value can be a :class:`~plexapi.library.FilterChoice` object,
+            a :class:`~plexapi.media.MediaTag` object, the exact name :attr:`MediaTag.tag` (*str*),
+            or the exact id :attr:`MediaTag.id` (*int*).
+        """
+        if isinstance(value, FilterChoice):
+            return value.key
+        if isinstance(value, media.MediaTag):
+            value = str(value.id or value.tag)
+        else:
+            value = str(value)
+        filterChoices = self.listFilterChoices(filterField.key, libtype)
+        matchValue = value.lower()
+        return next((f.key for f in filterChoices if matchValue in {f.key.lower(), f.title.lower()}), value)
+
+    def _validateSortFields(self, sort, libtype=None):
+        """ Validates a list of filter sort fields is available for the library. Sort fields can be a
+            list of :class:`~plexapi.library.FilteringSort` objects, or a comma separated string.
+            Returns the validated comma separated sort fields string.
+        """
+        if isinstance(sort, str):
+            sort = sort.split(',')
+
+        if not isinstance(sort, (list, tuple)):
+            sort = [sort]
+
+        validatedSorts = []
+        for _sort in sort:
+            validatedSorts.append(self._validateSortField(_sort, libtype))
+
+        return ','.join(validatedSorts)
+
+    def _validateSortField(self, sort, libtype=None):
+        """ Validates a filter sort field is available for the library. A sort field can be a
+            :class:`~plexapi.library.FilteringSort` object, or a string.
+            Returns the validated sort field string.
+        """
+        if isinstance(sort, FilteringSort):
+            return '%s.%s:%s' % (libtype or self.TYPE, sort.key, sort.defaultDirection)
+
+        match = re.match(r'(?:([a-zA-Z]*)\.)?([a-zA-Z]+):?([a-zA-Z]*)', sort.strip())
+        if not match:
+            raise BadRequest('Invalid filter sort: %s' % sort)
+        _libtype, sortField, sortDir = match.groups()
+        libtype = _libtype or libtype or self.TYPE
+
+        try:
+            filterSort = next(f for f in self.listSorts(libtype) if f.key == sortField)
+        except StopIteration:
+            availableSorts = [f.key for f in self.listSorts(libtype)]
+            raise NotFound('Unknown sort field "%s" for libtype "%s". '
+                           'Available sort fields: %s'
+                           % (sortField, libtype, availableSorts)) from None
+
+        sortField = libtype + '.' + filterSort.key
+
+        availableDirections = ['', 'asc', 'desc', 'nullsLast']
+        if sortDir not in availableDirections:
+            raise NotFound('Unknown sort direction "%s". '
+                           'Available sort directions: %s'
+                           % (sortDir, availableDirections))
+
+        return '%s:%s' % (sortField, sortDir) if sortDir else sortField
+
+    def _validateAdvancedSearch(self, filters, libtype):
+        """ Validates an advanced search filter dictionary.
+            Returns the list of validated URL encoded parameter strings for the advanced search.
+        """
+        if not isinstance(filters, dict):
+            raise BadRequest('Filters must be a dictionary.')
+
+        validatedFilters = []
+
+        for field, values in filters.items():
+            if field.lower() in {'and', 'or'}:
+                if len(filters.items()) > 1:
+                    raise BadRequest('Multiple keys in the same dictionary with and/or is not allowed.')
+                if not isinstance(values, list):
+                    raise BadRequest('Value for and/or keys must be a list of dictionaries.')
+
+                validatedFilters.append('push=1')
+
+                for value in values:
+                    validatedFilters.extend(self._validateAdvancedSearch(value, libtype))
+                    validatedFilters.append('%s=1' % field.lower())
+
+                del validatedFilters[-1]
+                validatedFilters.append('pop=1')
+
+            else:
+                validatedFilters.append(self._validateFilterField(field, values, libtype))
+
+        return validatedFilters
+
+    def _buildSearchKey(self, title=None, sort=None, libtype=None, limit=None, filters=None, returnKwargs=False, **kwargs):
+        """ Returns the validated and formatted search query API key
+            (``/library/sections/<sectionKey>/all?<params>``).
+        """
         args = {}
-        for category, value in list(kwargs.items()):
-            if category.split('__')[-1] not in OPERATORS:
-                args[category] = self._cleanSearchFilter(category, value, libtype)
-                del kwargs[category]
+        filter_args = []
+
+        args['includeGuids'] = int(bool(kwargs.pop('includeGuids', True)))
+        for field, values in list(kwargs.items()):
+            if field.split('__')[-1] not in OPERATORS:
+                filter_args.append(self._validateFilterField(field, values, libtype))
+                del kwargs[field]
         if title is not None:
-            args['title'] = title
+            if isinstance(title, (list, tuple)):
+                filter_args.append(self._validateFilterField('title', title, libtype))
+            else:
+                args['title'] = title
+        if filters is not None:
+            filter_args.extend(self._validateAdvancedSearch(filters, libtype))
         if sort is not None:
-            args['sort'] = self._cleanSearchSort(sort)
+            args['sort'] = self._validateSortFields(sort, libtype)
         if libtype is not None:
             args['type'] = utils.searchType(libtype)
+        if limit is not None:
+            args['limit'] = limit
 
+        joined_args = utils.joinArgs(args).lstrip('?')
+        joined_filter_args = '&'.join(filter_args) if filter_args else ''
+        params = '&'.join([joined_args, joined_filter_args]).strip('&')
+        key = '/library/sections/%s/all?%s' % (self.key, params)
+
+        if returnKwargs:
+            return key, kwargs
+        return key
+
+    def hubSearch(self, query, mediatype=None, limit=None):
+        """ Returns the hub search results for this library. See :func:`plexapi.server.PlexServer.search`
+            for details and parameters.
+        """
+        return self._server.search(query, mediatype, limit, sectionId=self.key)
+
+    def search(self, title=None, sort=None, maxresults=None, libtype=None,
+               container_start=0, container_size=X_PLEX_CONTAINER_SIZE, limit=None, filters=None, **kwargs):
+        """ Search the library. The http requests will be batched in container_size. If you are only looking for the
+            first <num> results, it would be wise to set the maxresults option to that amount so the search doesn't iterate
+            over all results on the server.
+
+            Parameters:
+                title (str, optional): General string query to search for. Partial string matches are allowed.
+                sort (:class:`~plexapi.library.FilteringSort` or str or list, optional): A field to sort the results.
+                    See the details below for more info.
+                maxresults (int, optional): Only return the specified number of results.
+                libtype (str, optional): Return results of a specific type (movie, show, season, episode,
+                    artist, album, track, photoalbum, photo, collection) (e.g. ``libtype='episode'`` will only
+                    return :class:`~plexapi.video.Episode` objects)
+                container_start (int, optional): Default 0.
+                container_size (int, optional): Default X_PLEX_CONTAINER_SIZE in your config file.
+                limit (int, optional): Limit the number of results from the filter.
+                filters (dict, optional): A dictionary of advanced filters. See the details below for more info.
+                **kwargs (dict): Additional custom filters to apply to the search results.
+                    See the details below for more info.
+
+            Raises:
+                :exc:`~plexapi.exceptions.BadRequest`: When the sort or filter is invalid.
+                :exc:`~plexapi.exceptions.NotFound`: When applying an unknown sort or filter.
+
+            **Sorting Results**
+
+            The search results can be sorted by including the ``sort`` parameter.
+
+            * See :func:`~plexapi.library.LibrarySection.listSorts` to get a list of available sort fields.
+
+            The ``sort`` parameter can be a :class:`~plexapi.library.FilteringSort` object or a sort string in the
+            format ``field:dir``. The sort direction ``dir`` can be ``asc``, ``desc``, or ``nullsLast``. Omitting the
+            sort direction or using a :class:`~plexapi.library.FilteringSort` object will sort the results in the default
+            direction of the field. Multi-sorting on multiple fields can be achieved by using a comma separated list of
+            sort strings, or a list of :class:`~plexapi.library.FilteringSort` object or strings.
+
+            Examples:
+
+                .. code-block:: python
+
+                    library.search(sort="titleSort:desc")  # Sort title in descending order
+                    library.search(sort="titleSort")  # Sort title in the default order
+                    # Multi-sort by year in descending order, then by audience rating in descending order
+                    library.search(sort="year:desc,audienceRating:desc")
+                    library.search(sort=["year:desc", "audienceRating:desc"])
+
+            **Using Plex Filters**
+
+            Any of the available custom filters can be applied to the search results
+            (`screenshot <../_static/images/LibrarySection.search.png>`__).
+
+            * See :func:`~plexapi.library.LibrarySection.listFields` to get a list of all available fields.
+            * See :func:`~plexapi.library.LibrarySection.listOperators` to get a list of all available operators.
+            * See :func:`~plexapi.library.LibrarySection.listFilterChoices` to get a list of all available filter values.
+
+            The following filter fields are just some examples of the possible filters. The list is not exaustive,
+            and not all filters apply to all library types.
+
+            * **actor** (:class:`~plexapi.media.MediaTag`): Search for the name of an actor.
+            * **addedAt** (*datetime*): Search for items added before or after a date. See operators below.
+            * **audioLanguage** (*str*): Search for a specific audio language (3 character code, e.g. jpn).
+            * **collection** (:class:`~plexapi.media.MediaTag`): Search for the name of a collection.
+            * **contentRating** (:class:`~plexapi.media.MediaTag`): Search for a specific content rating.
+            * **country** (:class:`~plexapi.media.MediaTag`): Search for the name of a country.
+            * **decade** (*int*): Search for a specific decade (e.g. 2000).
+            * **director** (:class:`~plexapi.media.MediaTag`): Search for the name of a director.
+            * **duplicate** (*bool*) Search for duplicate items.
+            * **genre** (:class:`~plexapi.media.MediaTag`): Search for a specific genre.
+            * **hdr** (*bool*): Search for HDR items.
+            * **inProgress** (*bool*): Search for in progress items.
+            * **label** (:class:`~plexapi.media.MediaTag`): Search for a specific label.
+            * **lastViewedAt** (*datetime*): Search for items watched before or after a date. See operators below.
+            * **mood** (:class:`~plexapi.media.MediaTag`): Search for a specific mood.
+            * **producer** (:class:`~plexapi.media.MediaTag`): Search for the name of a producer.
+            * **resolution** (*str*): Search for a specific resolution (e.g. 1080).
+            * **studio** (*str*): Search for the name of a studio.
+            * **style** (:class:`~plexapi.media.MediaTag`): Search for a specific style.
+            * **subtitleLanguage** (*str*): Search for a specific subtitle language (3 character code, e.g. eng)
+            * **unmatched** (*bool*): Search for unmatched items.
+            * **unwatched** (*bool*): Search for unwatched items.
+            * **userRating** (*int*): Search for items with a specific user rating.
+            * **writer** (:class:`~plexapi.media.MediaTag`): Search for the name of a writer.
+            * **year** (*int*): Search for a specific year.
+
+            Tag type filter values can be a :class:`~plexapi.library.FilterChoice` object,
+            :class:`~plexapi.media.MediaTag` object, the exact name :attr:`MediaTag.tag` (*str*),
+            or the exact id :attr:`MediaTag.id` (*int*).
+            
+            Date type filter values can be a ``datetime`` object, a relative date using a one of the
+            available date suffixes (e.g. ``30d``) (*str*), or a date in ``YYYY-MM-DD`` (*str*) format.
+
+            Relative date suffixes:
+
+            * ``s``: ``seconds``
+            * ``m``: ``minutes``
+            * ``h``: ``hours``
+            * ``d``: ``days``
+            * ``w``: ``weeks``
+            * ``mon``: ``months``
+            * ``y``: ``years``
+            
+            Multiple values can be ``OR`` together by providing a list of values.
+
+            Examples:
+
+                .. code-block:: python
+
+                    library.search(unwatched=True, year=2020, resolution="4k")
+                    library.search(actor="Arnold Schwarzenegger", decade=1990)
+                    library.search(contentRating="TV-G", genre="animation")
+                    library.search(genre=["animation", "comedy"])  # Genre is animation OR comedy
+                    library.search(studio=["Disney", "Pixar"])  # Studio contains Disney OR Pixar
+
+            **Using a** ``libtype`` **Prefix**
+
+            Some filters may be prefixed by the ``libtype`` separated by a ``.`` (e.g. ``show.collection``,
+            ``episode.title``, ``artist.style``, ``album.genre``, ``track.userRating``, etc.). This should not be
+            confused with the ``libtype`` parameter. If no ``libtype`` prefix is provided, then the default library
+            type is assumed. For example, in a TV show library ``viewCout`` is assumed to be ``show.viewCount``.
+            If you want to filter using episode view count then you must specify ``episode.viewCount`` explicitly.
+            In addition, if the filter does not exist for the default library type it will fallback to the most
+            specific ``libtype`` available. For example, ``show.unwatched`` does not exists so it will fallback to
+            ``episode.unwatched``. The ``libtype`` prefix cannot be included directly in the function parameters so
+            the filters must be provided as a filters dictionary.
+
+            Examples:
+
+                .. code-block:: python
+
+                    library.search(filters={"show.collection": "Documentary", "episode.inProgress": True})
+                    library.search(filters={"artist.genre": "pop", "album.decade": 2000})
+
+                    # The following three options are identical and will return Episode objects
+                    showLibrary.search(title="Winter is Coming", libtype='episode')
+                    showLibrary.search(libtype='episode', filters={"episode.title": "Winter is Coming"})
+                    showLibrary.searchEpisodes(title="Winter is Coming")
+
+                    # The following will search for the episode title but return Show objects
+                    showLibrary.search(filters={"episode.title": "Winter is Coming"})
+
+                    # The following will fallback to episode.unwatched
+                    showLibrary.search(unwatched=True)
+
+            **Using Plex Operators**
+
+            Operators can be appended to the filter field to narrow down results with more granularity. If no
+            operator is specified, the default operator is assumed to be ``=``. The following is a list of
+            possible operators depending on the data type of the filter being applied. A special ``&`` operator
+            can also be used to ``AND`` together a list of values.
+
+            Type: :class:`~plexapi.media.MediaTag` or *subtitleLanguage* or *audioLanguage*
+
+            * ``=``: ``is``
+            * ``!=``: ``is not``
+
+            Type: *int*
+
+            * ``=``: ``is``
+            * ``!=``: ``is not``
+            * ``>>=``: ``is greater than``
+            * ``<<=``: ``is less than``
+
+            Type: *str*
+
+            * ``=``: ``contains``
+            * ``!=``: ``does not contain``
+            * ``==``: ``is``
+            * ``!==``: ``is not``
+            * ``<=``: ``begins with``
+            * ``>=``: ``ends with``
+
+            Type: *bool*
+
+            * ``=``: ``is true``
+            * ``!=``: ``is false``
+
+            Type: *datetime*
+
+            * ``<<=``: ``is before``
+            * ``>>=``: ``is after``
+
+            Type: *resolution*
+
+            * ``=``: ``is``
+
+            Operators cannot be included directly in the function parameters so the filters
+            must be provided as a filters dictionary. The trailing ``=`` on the operator may be excluded.
+
+            Examples:
+
+                .. code-block:: python
+
+                    # Genre is horror AND thriller
+                    library.search(filters={"genre&": ["horror", "thriller"]})
+
+                    # Director is not Steven Spielberg
+                    library.search(filters={"director!": "Steven Spielberg"})
+
+                    # Title starts with Marvel and added before 2021-01-01
+                    library.search(filters={"title<": "Marvel", "addedAt<<": "2021-01-01"})
+
+                    # Added in the last 30 days using relative dates
+                    library.search(filters={"addedAt>>": "30d"})
+
+                    # Collection is James Bond and user rating is greater than 8
+                    library.search(filters={"collection": "James Bond", "userRating>>": 8})
+
+            **Using Advanced Filters**
+
+            Any of the Plex filters described above can be combined into a single ``filters`` dictionary that mimics
+            the advanced filters used in Plex Web with a tree of ``and``/``or`` branches. Each level of the tree must
+            start with ``and`` (Match all of the following) or ``or`` (Match any of the following) as the dictionary
+            key, and a list of dictionaries with the desired filters as the dictionary value.
+
+            The following example matches `this <../_static/images/LibrarySection.search_filters.png>`__ advanced filter
+            in Plex Web.
+
+            Examples:
+
+                .. code-block:: python
+
+                    advancedFilters = {
+                        'and': [                            # Match all of the following in this list
+                            {
+                                'or': [                     # Match any of the following in this list
+                                    {'title': 'elephant'},
+                                    {'title': 'bunny'}
+                                ]
+                            },
+                            {'year>>': 1990},
+                            {'unwatched': True}
+                        ]
+                    }
+                    library.search(filters=advancedFilters)
+
+            **Using PlexAPI Operators**
+
+            For even more advanced filtering which cannot be achieved in Plex, the PlexAPI operators can be applied
+            to any XML attribute. See :func:`plexapi.base.PlexObject.fetchItems` for a list of operators and how they
+            are used. Note that using the Plex filters above will be faster since the filters are applied by the Plex
+            server before the results are returned to PlexAPI. Using the PlexAPI operators requires the Plex server
+            to return *all* results to allow PlexAPI to do the filtering. The Plex filters and the PlexAPI operators
+            can be used in conjunction with each other.
+
+            Examples:
+
+                .. code-block:: python
+
+                    library.search(summary__icontains="Christmas")
+                    library.search(duration__gt=7200000)
+                    library.search(audienceRating__lte=6.0, audienceRatingImage__startswith="rottentomatoes://")
+                    library.search(media__videoCodec__exact="h265")
+                    library.search(genre="holiday", viewCount__gte=3)
+
+        """
+        key, kwargs = self._buildSearchKey(
+            title=title, sort=sort, libtype=libtype, limit=limit, filters=filters, returnKwargs=True, **kwargs)
+        return self._search(key, maxresults, container_start, container_size, **kwargs)
+
+    def _search(self, key, maxresults, container_start, container_size, **kwargs):
+        """ Perform the actual library search and return the results. """
         results = []
         subresults = []
         offset = container_start
 
         if maxresults is not None:
             container_size = min(container_size, maxresults)
+
         while True:
-            key = '/library/sections/%s/all%s' % (self.key, utils.joinArgs(args))
             subresults = self.fetchItems(key, container_start=container_start,
                                          container_size=container_size, **kwargs)
             if not len(subresults):
-                if offset > self.totalSize:
-                    log.info("container_start is higher then the number of items in the library")
-                break
+                if offset > self._totalViewSize:
+                    log.info("container_start is higher than the number of items in the library")
 
             results.extend(subresults)
 
-            # self.totalSize is not used as a condition in the while loop as
+            # self._totalViewSize is not used as a condition in the while loop as
             # this require a additional http request.
-            # self.totalSize is updated from .fetchItems
-            wanted_number_of_items = self.totalSize - offset
+            # self._totalViewSize is updated from self.fetchItems
+            wanted_number_of_items = self._totalViewSize - offset
             if maxresults is not None:
                 wanted_number_of_items = min(maxresults, wanted_number_of_items)
                 container_size = min(container_size, maxresults - len(results))
@@ -705,48 +1385,10 @@ class LibrarySection(PlexObject):
 
             container_start += container_size
 
+            if container_start > self._totalViewSize:
+                break
+
         return results
-
-    def _cleanSearchFilter(self, category, value, libtype=None):
-        # check a few things before we begin
-        categories = [x.key for x in self.filterFields()]
-        booleanFilters = [x.key for x in self.filterFields() if x.type == 'boolean']
-        if category.endswith('!'):
-            if category[:-1] not in categories:
-                raise BadRequest('Unknown filter category: %s' % category[:-1])
-        elif category not in categories:
-            raise BadRequest('Unknown filter category: %s' % category)
-        if category in booleanFilters:
-            return '1' if value else '0'
-        if not isinstance(value, (list, tuple)):
-            value = [value]
-        # convert list of values to list of keys or ids
-        result = set()
-        choices = self.listChoices(category, libtype)
-        lookup = {c.title.lower(): unquote(unquote(c.key)) for c in choices}
-        allowed = {c.key for c in choices}
-        for item in value:
-            item = str((item.id or item.tag) if isinstance(item, media.MediaTag) else item).lower()
-            # find most logical choice(s) to use in url
-            if item in allowed: result.add(item); continue
-            if item in lookup: result.add(lookup[item]); continue
-            matches = [k for t, k in lookup.items() if item in t]
-            if matches: map(result.add, matches); continue
-            # nothing matched; use raw item value
-            log.debug('Filter value not listed, using raw item value: %s' % item)
-            result.add(item)
-        return ','.join(result)
-
-    def _cleanSearchSort(self, sort):
-        sort = '%s:asc' % sort if ':' not in sort else sort
-        scol, sdir = sort.lower().split(':')
-        allowedSort = [sort.key for sort in self._sorts()]
-        lookup = {s.lower(): s for s in allowedSort}
-        if scol not in lookup:
-            raise BadRequest('Unknown sort column: %s' % scol)
-        if sdir not in ('asc', 'desc'):
-            raise BadRequest('Unknown sort dir: %s' % sdir)
-        return '%s:%s' % (lookup[scol], sdir)
 
     def _locations(self):
         """ Returns a list of :class:`~plexapi.library.Location` objects
@@ -782,6 +1424,8 @@ class LibrarySection(PlexObject):
 
             Raises:
                 :exc:`~plexapi.exceptions.BadRequest`: When the library is not allowed to sync.
+                :exc:`~plexapi.exceptions.BadRequest`: When the sort or filter is invalid.
+                :exc:`~plexapi.exceptions.NotFound`: When applying an unknown sort or filter.
 
             Example:
 
@@ -805,14 +1449,6 @@ class LibrarySection(PlexObject):
         if not self.allowSync:
             raise BadRequest('The requested library is not allowed to sync')
 
-        args = {}
-        for category, value in kwargs.items():
-            args[category] = self._cleanSearchFilter(category, value, libtype)
-        if sort is not None:
-            args['sort'] = self._cleanSearchSort(sort)
-        if libtype is not None:
-            args['type'] = utils.searchType(libtype)
-
         myplex = self._server.myPlexAccount()
         sync_item = SyncItem(self._server, None)
         sync_item.title = title if title else self.title
@@ -821,9 +1457,9 @@ class LibrarySection(PlexObject):
         sync_item.metadataType = self.METADATA_TYPE
         sync_item.machineIdentifier = self._server.machineIdentifier
 
-        key = '/library/sections/%s/all' % self.key
+        key = self._buildSearchKey(title=title, sort=sort, libtype=libtype, **kwargs)
 
-        sync_item.location = 'library://%s/directory/%s' % (self.uuid, quote_plus(key + utils.joinArgs(args)))
+        sync_item.location = 'library://%s/directory/%s' % (self.uuid, quote_plus(key))
         sync_item.policy = policy
         sync_item.mediaSettings = mediaSettings
 
@@ -837,9 +1473,28 @@ class LibrarySection(PlexObject):
         """
         return self._server.history(maxresults=maxresults, mindate=mindate, librarySectionID=self.key, accountID=1)
 
-    @deprecated('use "collections" (plural) instead')
-    def collection(self, **kwargs):
-        return self.collections()
+    def createCollection(self, title, items=None, smart=False, limit=None,
+                         libtype=None, sort=None, filters=None, **kwargs):
+        """ Alias for :func:`~plexapi.server.PlexServer.createCollection` using this
+            :class:`~plexapi.library.LibrarySection`.
+        """
+        return self._server.createCollection(
+            title, section=self, items=items, smart=smart, limit=limit,
+            libtype=libtype, sort=sort, filters=filters, **kwargs)
+
+    def collection(self, title):
+        """ Returns the collection with the specified title.
+
+            Parameters:
+                title (str): Title of the item to return.
+
+            Raises:
+                :exc:`~plexapi.exceptions.NotFound`: Unable to find collection.
+        """
+        try:
+            return self.collections(title=title, title__iexact=title)[0]
+        except IndexError:
+            raise NotFound('Unable to find collection with title "%s".' % title) from None
 
     def collections(self, **kwargs):
         """ Returns a list of collections from this library section.
@@ -847,10 +1502,58 @@ class LibrarySection(PlexObject):
         """
         return self.search(libtype='collection', **kwargs)
 
-    def playlists(self, **kwargs):
+    def createPlaylist(self, title, items=None, smart=False, limit=None,
+                       sort=None, filters=None, **kwargs):
+        """ Alias for :func:`~plexapi.server.PlexServer.createPlaylist` using this
+            :class:`~plexapi.library.LibrarySection`.
+        """
+        return self._server.createPlaylist(
+            title, section=self, items=items, smart=smart, limit=limit,
+            sort=sort, filters=filters, **kwargs)
+
+    def playlist(self, title):
+        """ Returns the playlist with the specified title.
+
+            Parameters:
+                title (str): Title of the item to return.
+
+            Raises:
+                :exc:`~plexapi.exceptions.NotFound`: Unable to find playlist.
+        """
+        try:
+            return self.playlists(title=title, title__iexact=title)[0]
+        except IndexError:
+            raise NotFound('Unable to find playlist with title "%s".' % title) from None
+
+    def playlists(self, sort=None, **kwargs):
         """ Returns a list of playlists from this library section. """
-        key = '/playlists?type=15&playlistType=%s&sectionID=%s' % (self.CONTENT_TYPE, self.key)
-        return self.fetchItems(key, **kwargs)
+        return self._server.playlists(
+            playlistType=self.CONTENT_TYPE, sectionId=self.key, sort=sort, **kwargs)
+
+    @deprecated('use "listFields" instead')
+    def filterFields(self, mediaType=None):
+        return self.listFields(libtype=mediaType)
+
+    @deprecated('use "listFilterChoices" instead')
+    def listChoices(self, category, libtype=None, **kwargs):
+        return self.listFilterChoices(field=category, libtype=libtype)
+
+    def getWebURL(self, base=None, tab=None, key=None):
+        """ Returns the Plex Web URL for the library.
+
+            Parameters:
+                base (str): The base URL before the fragment (``#!``).
+                    Default is https://app.plex.tv/desktop.
+                tab (str): The library tab (recommended, library, collections, playlists, timeline).
+                key (str): A hub key.
+        """
+        params = {'source': self.key}
+        if tab is not None:
+            params['pivot'] = tab
+        if key is not None:
+            params['key'] = key
+            params['pageType'] = 'list'
+        return self._server._buildWebURL(base=base, **params)
 
 
 class MovieSection(LibrarySection):
@@ -864,6 +1567,18 @@ class MovieSection(LibrarySection):
     TYPE = 'movie'
     METADATA_TYPE = 'movie'
     CONTENT_TYPE = 'video'
+
+    def searchMovies(self, **kwargs):
+        """ Search for a movie. See :func:`~plexapi.library.LibrarySection.search` for usage. """
+        return self.search(libtype='movie', **kwargs)
+
+    def recentlyAddedMovies(self, maxresults=50):
+        """ Returns a list of recently added movies from this library section.
+
+            Parameters:
+                maxresults (int): Max number of items to return (default 50).
+        """
+        return self.recentlyAdded(maxresults=maxresults, libtype='movie')
 
     def sync(self, videoQuality, limit=None, unwatched=False, **kwargs):
         """ Add current Movie library section as sync item for specified device.
@@ -908,7 +1623,6 @@ class ShowSection(LibrarySection):
             TAG (str): 'Directory'
             TYPE (str): 'show'
     """
-
     TAG = 'Directory'
     TYPE = 'show'
     METADATA_TYPE = 'episode'
@@ -918,17 +1632,37 @@ class ShowSection(LibrarySection):
         """ Search for a show. See :func:`~plexapi.library.LibrarySection.search` for usage. """
         return self.search(libtype='show', **kwargs)
 
+    def searchSeasons(self, **kwargs):
+        """ Search for a season. See :func:`~plexapi.library.LibrarySection.search` for usage. """
+        return self.search(libtype='season', **kwargs)
+
     def searchEpisodes(self, **kwargs):
         """ Search for an episode. See :func:`~plexapi.library.LibrarySection.search` for usage. """
         return self.search(libtype='episode', **kwargs)
 
-    def recentlyAdded(self, libtype='episode', maxresults=50):
+    def recentlyAddedShows(self, maxresults=50):
+        """ Returns a list of recently added shows from this library section.
+
+            Parameters:
+                maxresults (int): Max number of items to return (default 50).
+        """
+        return self.recentlyAdded(maxresults=maxresults, libtype='show')
+
+    def recentlyAddedSeasons(self, maxresults=50):
+        """ Returns a list of recently added seasons from this library section.
+
+            Parameters:
+                maxresults (int): Max number of items to return (default 50).
+        """
+        return self.recentlyAdded(maxresults=maxresults, libtype='season')
+
+    def recentlyAddedEpisodes(self, maxresults=50):
         """ Returns a list of recently added episodes from this library section.
 
             Parameters:
                 maxresults (int): Max number of items to return (default 50).
         """
-        return self.search(sort='episode.addedAt:desc', libtype=libtype, maxresults=maxresults)
+        return self.recentlyAdded(maxresults=maxresults, libtype='episode')
 
     def sync(self, videoQuality, limit=None, unwatched=False, **kwargs):
         """ Add current Show library section as sync item for specified device.
@@ -975,9 +1709,8 @@ class MusicSection(LibrarySection):
     """
     TAG = 'Directory'
     TYPE = 'artist'
-
-    CONTENT_TYPE = 'audio'
     METADATA_TYPE = 'track'
+    CONTENT_TYPE = 'audio'
 
     def albums(self):
         """ Returns a list of :class:`~plexapi.audio.Album` objects in this section. """
@@ -1000,6 +1733,30 @@ class MusicSection(LibrarySection):
     def searchTracks(self, **kwargs):
         """ Search for a track. See :func:`~plexapi.library.LibrarySection.search` for usage. """
         return self.search(libtype='track', **kwargs)
+
+    def recentlyAddedArtists(self, maxresults=50):
+        """ Returns a list of recently added artists from this library section.
+
+            Parameters:
+                maxresults (int): Max number of items to return (default 50).
+        """
+        return self.recentlyAdded(maxresults=maxresults, libtype='artist')
+
+    def recentlyAddedAlbums(self, maxresults=50):
+        """ Returns a list of recently added albums from this library section.
+
+            Parameters:
+                maxresults (int): Max number of items to return (default 50).
+        """
+        return self.recentlyAdded(maxresults=maxresults, libtype='album')
+
+    def recentlyAddedTracks(self, maxresults=50):
+        """ Returns a list of recently added tracks from this library section.
+
+            Parameters:
+                maxresults (int): Max number of items to return (default 50).
+        """
+        return self.recentlyAdded(maxresults=maxresults, libtype='track')
 
     def sync(self, bitrate, limit=None, **kwargs):
         """ Add current Music library section as sync item for specified device.
@@ -1045,8 +1802,8 @@ class PhotoSection(LibrarySection):
     """
     TAG = 'Directory'
     TYPE = 'photo'
-    CONTENT_TYPE = 'photo'
     METADATA_TYPE = 'photo'
+    CONTENT_TYPE = 'photo'
 
     def all(self, libtype=None, **kwargs):
         """ Returns a list of all items from this library section.
@@ -1059,12 +1816,21 @@ class PhotoSection(LibrarySection):
         raise NotImplementedError('Collections are not available for a Photo library.')
 
     def searchAlbums(self, title, **kwargs):
-        """ Search for an album. See :func:`~plexapi.library.LibrarySection.search` for usage. """
+        """ Search for a photo album. See :func:`~plexapi.library.LibrarySection.search` for usage. """
         return self.search(libtype='photoalbum', title=title, **kwargs)
 
     def searchPhotos(self, title, **kwargs):
         """ Search for a photo. See :func:`~plexapi.library.LibrarySection.search` for usage. """
         return self.search(libtype='photo', title=title, **kwargs)
+
+    def recentlyAddedAlbums(self, maxresults=50):
+        """ Returns a list of recently added photo albums from this library section.
+
+            Parameters:
+                maxresults (int): Max number of items to return (default 50).
+        """
+        # Use search() instead of recentlyAdded() because libtype=None
+        return self.search(sort='addedAt:desc', maxresults=maxresults)
 
     def sync(self, resolution, limit=None, **kwargs):
         """ Add current Music library section as sync item for specified device.
@@ -1099,34 +1865,6 @@ class PhotoSection(LibrarySection):
         kwargs['mediaSettings'] = MediaSettings.createPhoto(resolution)
         kwargs['policy'] = Policy.create(limit)
         return super(PhotoSection, self).sync(**kwargs)
-
-
-class FilterChoice(PlexObject):
-    """ Represents a single filter choice. These objects are gathered when using filters
-        while searching for library items and is the object returned in the result set of
-        :func:`~plexapi.library.LibrarySection.listChoices`.
-
-        Attributes:
-            TAG (str): 'Directory'
-            server (:class:`~plexapi.server.PlexServer`): PlexServer this client is connected to.
-            initpath (str): Relative path requested when retrieving specified `data` (optional).
-            fastKey (str): API path to quickly list all items in this filter
-                (/library/sections/<section>/all?genre=<key>)
-            key (str): Short key (id) of this filter option (used ad <key> in fastKey above).
-            thumb (str): Thumbnail used to represent this filter option.
-            title (str): Human readable name for this filter option.
-            type (str): Filter type (genre, contentRating, etc).
-    """
-    TAG = 'Directory'
-
-    def _loadData(self, data):
-        """ Load attribute values from Plex XML response. """
-        self._data = data
-        self.fastKey = data.attrib.get('fastKey')
-        self.key = data.attrib.get('key')
-        self.thumb = data.attrib.get('thumb')
-        self.title = data.attrib.get('title')
-        self.type = data.attrib.get('type')
 
 
 @utils.registerPlexObject
@@ -1187,25 +1925,6 @@ class Location(PlexObject):
         self.path = data.attrib.get('path')
 
 
-class Filter(PlexObject):
-    """ Represents a single Filter.
-
-        Attributes:
-            TAG (str): 'Directory'
-            TYPE (str): 'filter'
-    """
-    TAG = 'Directory'
-    TYPE = 'filter'
-
-    def _loadData(self, data):
-        self._data = data
-        self.filter = data.attrib.get('filter')
-        self.filterType = data.attrib.get('filterType')
-        self.key = data.attrib.get('key')
-        self.title = data.attrib.get('title')
-        self.type = data.attrib.get('type')
-
-
 @utils.registerPlexObject
 class Hub(PlexObject):
     """ Represents a single Hub (or category) in the PlexServer search.
@@ -1236,6 +1955,7 @@ class Hub(PlexObject):
         self.style = data.attrib.get('style')
         self.title = data.attrib.get('title')
         self.type = data.attrib.get('type')
+        self._section = None  # cache for self.section
 
     def __len__(self):
         return self.size
@@ -1254,6 +1974,13 @@ class Hub(PlexObject):
         """ Reloads the hub to fetch new items in the hub. """
         if self.key:
             self._items = self.fetchItems(self.key)
+
+    def section(self):
+        """ Returns the :class:`~plexapi.library.LibrarySection` this hub belongs to.
+        """
+        if self._section is None:
+            self._section = self._server.library.sectionByID(self.librarySectionID)
+        return self._section
 
 
 class HubMediaTag(PlexObject):
@@ -1298,6 +2025,12 @@ class HubMediaTag(PlexObject):
         self.tagType = utils.cast(int, data.attrib.get('tagType'))
         self.tagValue = utils.cast(int, data.attrib.get('tagValue'))
         self.thumb = data.attrib.get('thumb')
+
+    def items(self, *args, **kwargs):
+        """ Return the list of items within this tag. """
+        if not self.key:
+            raise BadRequest('Key is not defined for this tag: %s' % self.tag)
+        return self.fetchItems(self.key)
 
 
 @utils.registerPlexObject
@@ -1393,39 +2126,200 @@ class Station(PlexObject):
         return self.size
 
 
-class Sort(PlexObject):
-    """ Represents a Sort element found in library.
+class FilteringType(PlexObject):
+    """ Represents a single filtering Type object for a library.
+
+        Attributes:
+            TAG (str): 'Type'
+            active (bool): True if this filter type is currently active.
+            fields (List<:class:`~plexapi.library.FilteringField`>): List of field objects.
+            filters (List<:class:`~plexapi.library.FilteringFilter`>): List of filter objects.
+            key (str): The API URL path for the libtype filter.
+            sorts (List<:class:`~plexapi.library.FilteringSort`>): List of sort objects.
+            title (str): The title for the libtype filter.
+            type (str): The libtype for the filter.
+    """
+    TAG = 'Type'
+
+    def __repr__(self):
+        _type = self._clean(self.firstAttr('type'))
+        return '<%s>' % ':'.join([p for p in [self.__class__.__name__, _type] if p])
+
+    def _loadData(self, data):
+        self._data = data
+        self.active = utils.cast(bool, data.attrib.get('active', '0'))
+        self.fields = self.findItems(data, FilteringField)
+        self.filters = self.findItems(data, FilteringFilter)
+        self.key = data.attrib.get('key')
+        self.sorts = self.findItems(data, FilteringSort)
+        self.title = data.attrib.get('title')
+        self.type = data.attrib.get('type')
+
+        # Add additional manual sorts and fields which are available
+        # but not exposed on the Plex server
+        self.sorts += self._manualSorts()
+        self.fields += self._manualFields()
+
+    def _manualSorts(self):
+        """ Manually add additional sorts which are available
+            but not exposed on the Plex server.
+        """
+        # Sorts: key, dir, title
+        additionalSorts = [
+            ('guid', 'asc', 'Guid'),
+            ('id', 'asc', 'Rating Key'),
+            ('index', 'asc', '%s Number' % self.type.capitalize()),
+            ('summary', 'asc', 'Summary'),
+            ('tagline', 'asc', 'Tagline'),
+            ('updatedAt', 'asc', 'Date Updated')
+        ]
+
+        if self.type == 'season':
+            additionalSorts.extend([
+                ('titleSort', 'asc', 'Title')
+            ])
+        elif self.type == 'track':
+            # Don't know what this is but it is valid
+            additionalSorts.extend([
+                ('absoluteIndex', 'asc', 'Absolute Index')
+            ])
+        elif self.type == 'photo':
+            additionalSorts.extend([
+                ('viewUpdatedAt', 'desc', 'View Updated At')
+            ])
+        elif self.type == 'collection':
+            additionalSorts.extend([
+                ('addedAt', 'asc', 'Date Added')
+            ])
+
+        manualSorts = []
+        for sortField, sortDir, sortTitle in additionalSorts:
+            sortXML = ('<Sort defaultDirection="%s" descKey="%s:desc" key="%s" title="%s" />'
+                       % (sortDir, sortField, sortField, sortTitle))
+            manualSorts.append(self._manuallyLoadXML(sortXML, FilteringSort))
+
+        return manualSorts
+
+    def _manualFields(self):
+        """ Manually add additional fields which are available
+            but not exposed on the Plex server.
+        """
+        # Fields: key, type, title
+        additionalFields = [
+            ('guid', 'string', 'Guid'),
+            ('id', 'integer', 'Rating Key'),
+            ('index', 'integer', '%s Number' % self.type.capitalize()),
+            ('lastRatedAt', 'date', '%s Last Rated' % self.type.capitalize()),
+            ('updatedAt', 'date', 'Date Updated')
+        ]
+
+        if self.type == 'movie':
+            additionalFields.extend([
+                ('audienceRating', 'integer', 'Audience Rating'),
+                ('rating', 'integer', 'Critic Rating'),
+                ('viewOffset', 'integer', 'View Offset')
+            ])
+        elif self.type == 'show':
+            additionalFields.extend([
+                ('audienceRating', 'integer', 'Audience Rating'),
+                ('originallyAvailableAt', 'date', 'Show Release Date'),
+                ('rating', 'integer', 'Critic Rating'),
+                ('unviewedLeafCount', 'integer', 'Episode Unplayed Count')
+            ])
+        elif self.type == 'season':
+            additionalFields.extend([
+                ('addedAt', 'date', 'Date Season Added'),
+                ('unviewedLeafCount', 'integer', 'Episode Unplayed Count'),
+                ('year', 'integer', 'Season Year')
+            ])
+        elif self.type == 'episode':
+            additionalFields.extend([
+                ('audienceRating', 'integer', 'Audience Rating'),
+                ('duration', 'integer', 'Duration'),
+                ('rating', 'integer', 'Critic Rating'),
+                ('viewOffset', 'integer', 'View Offset')
+            ])
+        elif self.type == 'track':
+            additionalFields.extend([
+                ('duration', 'integer', 'Duration'),
+                ('viewOffset', 'integer', 'View Offset')
+            ])
+        elif self.type == 'collection':
+            additionalFields.extend([
+                ('addedAt', 'date', 'Date Added')
+            ])
+
+        prefix = '' if self.type == 'movie' else self.type + '.'
+
+        manualFields = []
+        for field, fieldType, fieldTitle in additionalFields:
+            fieldXML = ('<Field key="%s%s" title="%s" type="%s"/>'
+                       % (prefix, field, fieldTitle, fieldType))
+            manualFields.append(self._manuallyLoadXML(fieldXML, FilteringField))
+
+        return manualFields
+
+
+class FilteringFilter(PlexObject):
+    """ Represents a single Filter object for a :class:`~plexapi.library.FilteringType`.
+
+        Attributes:
+            TAG (str): 'Filter'
+            filter (str): The key for the filter.
+            filterType (str): The :class:`~plexapi.library.FilteringFieldType` type (string, boolean, integer, date, etc).
+            key (str): The API URL path for the filter.
+            title (str): The title of the filter.
+            type (str): 'filter'
+    """
+    TAG = 'Filter'
+
+    def _loadData(self, data):
+        self._data = data
+        self.filter = data.attrib.get('filter')
+        self.filterType = data.attrib.get('filterType')
+        self.key = data.attrib.get('key')
+        self.title = data.attrib.get('title')
+        self.type = data.attrib.get('type')
+
+
+class FilteringSort(PlexObject):
+    """ Represents a single Sort object for a :class:`~plexapi.library.FilteringType`.
 
         Attributes:
             TAG (str): 'Sort'
-            defaultDirection (str): Default sorting direction.
-            descKey (str): Url key for sorting with desc.
-            key (str): Url key for sorting,
-            title (str): Title of sorting,
-            firstCharacterKey (str): Url path for first character endpoint.
+            active (bool): True if the sort is currently active.
+            activeDirection (str): The currently active sorting direction.
+            default (str): The currently active default sorting direction.
+            defaultDirection (str): The default sorting direction.
+            descKey (str): The URL key for sorting with desc.
+            firstCharacterKey (str): API URL path for first character endpoint.
+            key (str): The URL key for the sorting.
+            title (str): The title of the sorting.
     """
     TAG = 'Sort'
 
     def _loadData(self, data):
         """ Load attribute values from Plex XML response. """
         self._data = data
+        self.active = utils.cast(bool, data.attrib.get('active', '0'))
+        self.activeDirection = data.attrib.get('activeDirection')
+        self.default = data.attrib.get('default')
         self.defaultDirection = data.attrib.get('defaultDirection')
         self.descKey = data.attrib.get('descKey')
+        self.firstCharacterKey = data.attrib.get('firstCharacterKey')
         self.key = data.attrib.get('key')
         self.title = data.attrib.get('title')
-        self.firstCharacterKey = data.attrib.get('firstCharacterKey')
 
 
-class FilterField(PlexObject):
-    """ Represents a Filters Field element found in library.
+class FilteringField(PlexObject):
+    """ Represents a single Field object for a :class:`~plexapi.library.FilteringType`.
 
         Attributes:
             TAG (str): 'Field'
-            key (str): Url key for filter,
-            title (str): Title of filter.
-            type (str): Type of filter (string, boolean, integer, date, etc).
-            subType (str): Subtype of filter (decade, rating, etc).
-            operators (str): Operators available for this filter.
+            key (str): The URL key for the filter field.
+            title (str): The title of the filter field.
+            type (str): The :class:`~plexapi.library.FilteringFieldType` type (string, boolean, integer, date, etc).
+            subType (str): The subtype of the filter (decade, rating, etc).
     """
     TAG = 'Field'
 
@@ -1436,17 +2330,36 @@ class FilterField(PlexObject):
         self.title = data.attrib.get('title')
         self.type = data.attrib.get('type')
         self.subType = data.attrib.get('subType')
-        self.operators = []
 
 
-@utils.registerPlexObject
-class Operator(PlexObject):
-    """ Represents an Operator available for filter.
+class FilteringFieldType(PlexObject):
+    """ Represents a single FieldType for library filtering.
+
+        Attributes:
+            TAG (str): 'FieldType'
+            type (str): The filtering data type (string, boolean, integer, date, etc).
+            operators (List<:class:`~plexapi.library.FilteringOperator`>): List of operator objects.
+    """
+    TAG = 'FieldType'
+
+    def __repr__(self):
+        _type = self._clean(self.firstAttr('type'))
+        return '<%s>' % ':'.join([p for p in [self.__class__.__name__, _type] if p])
+
+    def _loadData(self, data):
+        """ Load attribute values from Plex XML response. """
+        self._data = data
+        self.type = data.attrib.get('type')
+        self.operators = self.findItems(data, FilteringOperator)
+
+
+class FilteringOperator(PlexObject):
+    """ Represents an single Operator for a :class:`~plexapi.library.FilteringFieldType`.
 
         Attributes:
             TAG (str): 'Operator'
-            key (str): Url key for operator.
-            title (str): Title of operator.
+            key (str): The URL key for the operator.
+            title (str): The title of the operator.
     """
     TAG = 'Operator'
 
@@ -1454,6 +2367,32 @@ class Operator(PlexObject):
         """ Load attribute values from Plex XML response. """
         self.key = data.attrib.get('key')
         self.title = data.attrib.get('title')
+
+
+class FilterChoice(PlexObject):
+    """ Represents a single FilterChoice object.
+        These objects are gathered when using filters while searching for library items and is the
+        object returned in the result set of :func:`~plexapi.library.LibrarySection.listFilterChoices`.
+
+        Attributes:
+            TAG (str): 'Directory'
+            fastKey (str): API URL path to quickly list all items with this filter choice.
+                (/library/sections/<section>/all?genre=<key>)
+            key (str): The id value of this filter choice.
+            thumb (str): Thumbnail URL for the filter choice.
+            title (str): The title of the filter choice.
+            type (str): The filter type (genre, contentRating, etc).
+    """
+    TAG = 'Directory'
+
+    def _loadData(self, data):
+        """ Load attribute values from Plex XML response. """
+        self._data = data
+        self.fastKey = data.attrib.get('fastKey')
+        self.key = data.attrib.get('key')
+        self.thumb = data.attrib.get('thumb')
+        self.title = data.attrib.get('title')
+        self.type = data.attrib.get('type')
 
 
 class Folder(PlexObject):
@@ -1493,28 +2432,6 @@ class Folder(PlexObject):
                             continue
                     break
         return folders
-
-
-@utils.registerPlexObject
-class FieldType(PlexObject):
-    """ Represents a FieldType for filter.
-
-        Attributes:
-            TAG (str): 'Operator'
-            type (str): Type of filter (string, boolean, integer, date, etc),
-            operators (str): Operators available for this filter.
-    """
-    TAG = 'FieldType'
-
-    def __repr__(self):
-        _type = self._clean(self.firstAttr('type'))
-        return '<%s>' % ':'.join([p for p in [self.__class__.__name__, _type] if p])
-
-    def _loadData(self, data):
-        """ Load attribute values from Plex XML response. """
-        self._data = data
-        self.type = data.attrib.get('type')
-        self.operators = self.findItems(data, Operator)
 
 
 class FirstCharacter(PlexObject):

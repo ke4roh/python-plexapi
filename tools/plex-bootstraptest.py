@@ -55,15 +55,15 @@ DOCKER_CMD = [
     "-p",
     "32414:32414/udp",
     "-e",
-    'TZ="Europe/London"',
-    "-e",
     "PLEX_CLAIM=%(claim_token)s",
     "-e",
     "ADVERTISE_IP=http://%(advertise_ip)s:32400/",
+    "-e",
+    "TZ=%(timezone)s",
+    "-e",
+    "LANG=%(language)s",
     "-h",
     "%(hostname)s",
-    "-e",
-    'TZ="%(timezone)s"',
     "-v",
     "%(destination)s/db:/config",
     "-v",
@@ -113,7 +113,7 @@ def clean_pms(server, path):
 
 
 def setup_music(music_path):
-    print("Setup files for music section..")
+    print("Setup files for the Music section..")
     makedirs(music_path, exist_ok=True)
 
     all_music = {
@@ -272,6 +272,8 @@ def create_section(server, section, opts):
     processed_media = 0
     expected_media_count = section.pop("expected_media_count", 0)
     expected_media_type = (section["type"],)
+    if section["type"] == "show":
+        expected_media_type = ("show", "season", "episode")
     if section["type"] == "artist":
         expected_media_type = ("artist", "album", "track")
     expected_media_type = tuple(SEARCHTYPES[t] for t in expected_media_type)
@@ -295,7 +297,7 @@ def create_section(server, section, opts):
                             cnt = 1
                             if entry["type"] == SEARCHTYPES["show"]:
                                 show = server.library.sectionByID(
-                                    str(entry["sectionID"])
+                                    entry["sectionID"]
                                 ).get(entry["title"])
                                 cnt = show.leafCount
                             bar.update(cnt)
@@ -349,6 +351,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--timezone", help="Timezone to set inside plex", default="UTC"
+    )  # noqa
+    parser.add_argument(
+        "--language", help="Language to set inside plex", default="en_US.UTF-8"
     )  # noqa
     parser.add_argument(
         "--destination",
@@ -439,6 +444,7 @@ if __name__ == "__main__":
             "hostname": opts.server_name,
             "claim_token": account.claimToken() if account else "",
             "timezone": opts.timezone,
+            "language": opts.language,
             "advertise_ip": opts.advertise_ip,
             "image_tag": opts.docker_tag,
             "container_name_extra": "" if account else "unclaimed-",
@@ -522,7 +528,7 @@ if __name__ == "__main__":
                 location="/data/Movies" if opts.no_docker is False else movies_path,
                 agent="tv.plex.agents.movie",
                 scanner="Plex Movie",
-                language='en-US',
+                language="en-US",
                 expected_media_count=num_movies,
             )
         )
@@ -537,8 +543,9 @@ if __name__ == "__main__":
                 name="TV Shows",
                 type="show",
                 location="/data/TV-Shows" if opts.no_docker is False else tvshows_path,
-                agent="com.plexapp.agents.thetvdb",
-                scanner="Plex Series Scanner",
+                agent="tv.plex.agents.series",
+                scanner="Plex TV Series",
+                language="en-US",
                 expected_media_count=num_ep,
             )
         )

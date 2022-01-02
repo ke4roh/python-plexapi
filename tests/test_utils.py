@@ -39,6 +39,15 @@ def test_utils_searchType():
         utils.searchType("kekekekeke")
 
 
+def test_utils_reverseSearchType():
+    st = utils.reverseSearchType(1)
+    assert st == "movie"
+    movie = utils.reverseSearchType("movie")
+    assert movie == "movie"
+    with pytest.raises(NotFound):
+        utils.reverseSearchType(-1)
+
+
 def test_utils_joinArgs():
     test_dict = {"genre": "action", "type": 1337}
     assert utils.joinArgs(test_dict) == "?genre=action&type=1337"
@@ -69,14 +78,14 @@ def test_utils_download(plex, episode):
     url = episode.getStreamURL()
     locations = episode.locations[0]
     session = episode._server._session
-    assert utils.download(url, plex._token, filename=locations, mocked=True)
+    assert utils.download(
+        url, plex._token, filename=locations, mocked=True)
     assert utils.download(
         url, plex._token, filename=locations, session=session, mocked=True
     )
     assert utils.download(
         episode.thumbUrl, plex._token, filename=episode.title, mocked=True
     )
-
 
 
 def test_millisecondToHumanstr():

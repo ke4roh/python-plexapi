@@ -9,11 +9,7 @@ try:
 except ImportError:
     from distutils.core import setup
 
-# Get the current version
-with open('plexapi/__init__.py') as handle:
-    for line in handle.readlines():
-        if line.startswith('VERSION'):
-            version = re.findall("'([0-9\.]+?)'", line)[0]
+from plexapi import const
 
 # Get README.rst contents
 readme = open('README.rst', 'r').read()
@@ -28,14 +24,14 @@ with open('requirements.txt') as handle:
 
 setup(
     name='PlexAPI',
-    version=version,
+    version=const.__version__,
     description='Python bindings for the Plex API.',
     author='Michael Shepanski',
     author_email='michael.shepanski@gmail.com',
     url='https://github.com/pkkid/python-plexapi',
     packages=['plexapi'],
     install_requires=requirements,
-    python_requires='>=3.5',
+    python_requires='>=3.6',
     long_description=readme,
     keywords=['plex', 'api'],
     classifiers=[

@@ -4,7 +4,9 @@ import functools
 import logging
 import os
 import re
+import string
 import time
+import unicodedata
 import warnings
 import zipfile
 from datetime import datetime
@@ -151,6 +153,7 @@ def searchType(libtype):
         Parameters:
             libtype (str): LibType to lookup (movie, show, season, episode, artist, album, track,
                                               collection)
+
         Raises:
             :exc:`~plexapi.exceptions.NotFound`: Unknown libtype
     """
@@ -159,6 +162,24 @@ def searchType(libtype):
         return libtype
     if SEARCHTYPES.get(libtype) is not None:
         return SEARCHTYPES[libtype]
+    raise NotFound('Unknown libtype: %s' % libtype)
+
+
+def reverseSearchType(libtype):
+    """ Returns the string value of the library type.
+
+        Parameters:
+            libtype (int): Integer value of the library type.
+
+        Raises:
+            :exc:`~plexapi.exceptions.NotFound`: Unknown libtype
+    """
+    if libtype in SEARCHTYPES:
+        return libtype
+    libtype = int(libtype)
+    for k, v in SEARCHTYPES.items():
+        if libtype == v:
+            return k
     raise NotFound('Unknown libtype: %s' % libtype)
 
 
@@ -203,9 +224,8 @@ def toDatetime(value, format=None):
         else:
             # https://bugs.python.org/issue30684
             # And platform support for before epoch seems to be flaky.
-            # TODO check for others errors too.
-            if int(value) <= 0:
-                value = 86400
+            # Also limit to max 32-bit integer
+            value = min(max(int(value), 86400), 2**31 - 1)
             value = datetime.fromtimestamp(int(value))
     return value
 
@@ -243,6 +263,13 @@ def toList(value, itemcast=None, delim=','):
     value = value or ''
     itemcast = itemcast or str
     return [itemcast(item) for item in value.split(delim) if item != '']
+
+
+def cleanFilename(filename, replace='_'):
+    whitelist = "-_.()[] {}{}".format(string.ascii_letters, string.digits)
+    cleaned_filename = unicodedata.normalize('NFKD', filename).encode('ASCII', 'ignore').decode()
+    cleaned_filename = ''.join(c if c in whitelist else replace for c in cleaned_filename)
+    return cleaned_filename
 
 
 def downloadSessionImages(server, filename=None, height=150, width=150,

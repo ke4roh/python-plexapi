@@ -1,8 +1,60 @@
 # -*- coding: utf-8 -*-
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import parse_qsl, quote_plus, unquote, urlencode, urlsplit
 
-from plexapi import media, utils
-from plexapi.exceptions import NotFound
+from plexapi import media, settings, utils
+from plexapi.exceptions import BadRequest, NotFound
+
+
+class AdvancedSettingsMixin(object):
+    """ Mixin for Plex objects that can have advanced settings. """
+
+    def preferences(self):
+        """ Returns a list of :class:`~plexapi.settings.Preferences` objects. """
+        data = self._server.query(self._details_key)
+        return self.findItems(data, settings.Preferences, rtag='Preferences')
+
+    def preference(self, pref):
+        """ Returns a :class:`~plexapi.settings.Preferences` object for the specified pref.
+
+            Parameters:
+                pref (str): The id of the preference to return.
+        """
+        prefs = self.preferences()
+        try:
+            return next(p for p in prefs if p.id == pref)
+        except StopIteration:
+            availablePrefs = [p.id for p in prefs]
+            raise NotFound('Unknown preference "%s" for %s. '
+                           'Available preferences: %s'
+                           % (pref, self.TYPE, availablePrefs)) from None
+
+    def editAdvanced(self, **kwargs):
+        """ Edit a Plex object's advanced settings. """
+        data = {}
+        key = '%s/prefs?' % self.key
+        preferences = {pref.id: pref for pref in self.preferences() if pref.enumValues}
+        for settingID, value in kwargs.items():
+            try:
+                pref = preferences[settingID]
+            except KeyError:
+                raise NotFound('%s not found in %s' % (value, list(preferences.keys())))
+            
+            enumValues = pref.enumValues
+            if enumValues.get(value, enumValues.get(str(value))):
+                data[settingID] = value
+            else:
+                raise NotFound('%s not found in %s' % (value, list(enumValues)))
+        url = key + urlencode(data)
+        self._server.query(url, method=self._server._session.put)
+
+    def defaultAdvanced(self):
+        """ Edit all of a Plex object's advanced settings to default. """
+        data = {}
+        key = '%s/prefs?' % self.key
+        for preference in self.preferences():
+            data[preference.id] = preference.default
+        url = key + urlencode(data)
+        self._server.query(url, method=self._server._session.put)
 
 
 class ArtUrlMixin(object):
@@ -45,6 +97,14 @@ class ArtMixin(ArtUrlMixin):
         """
         art.select()
 
+    def lockArt(self):
+        """ Lock the background artwork for a Plex object. """
+        self._edit(**{'art.locked': 1})
+
+    def unlockArt(self):
+        """ Unlock the background artwork for a Plex object. """
+        self._edit(**{'art.locked': 0})
+
 
 class BannerUrlMixin(object):
     """ Mixin for Plex objects that can have a banner url. """
@@ -85,6 +145,14 @@ class BannerMixin(BannerUrlMixin):
                 banner (:class:`~plexapi.media.Banner`): The banner object to select.
         """
         banner.select()
+
+    def lockBanner(self):
+        """ Lock the banner for a Plex object. """
+        self._edit(**{'banner.locked': 1})
+
+    def unlockBanner(self):
+        """ Unlock the banner for a Plex object. """
+        self._edit(**{'banner.locked': 0})
 
 
 class PosterUrlMixin(object):
@@ -131,6 +199,34 @@ class PosterMixin(PosterUrlMixin):
                 poster (:class:`~plexapi.media.Poster`): The poster object to select.
         """
         poster.select()
+
+    def lockPoster(self):
+        """ Lock the poster for a Plex object. """
+        self._edit(**{'thumb.locked': 1})
+
+    def unlockPoster(self):
+        """ Unlock the poster for a Plex object. """
+        self._edit(**{'thumb.locked': 0})
+
+
+class RatingMixin(object):
+    """ Mixin for Plex objects that can have user star ratings. """
+
+    def rate(self, rating=None):
+        """ Rate the Plex object. Note: Plex ratings are displayed out of 5 stars (e.g. rating 7.0 = 3.5 stars).
+
+            Parameters:
+                rating (float, optional): Rating from 0 to 10. Exclude to reset the rating.
+
+            Raises:
+                :exc:`~plexapi.exceptions.BadRequest`: If the rating is invalid.
+        """
+        if rating is None:
+            rating = -1
+        elif not isinstance(rating, (int, float)) or rating < 0 or rating > 10:
+            raise BadRequest('Rating must be between 0 to 10.')
+        key = '/:/rate?key=%s&identifier=com.plexapp.plugins.library&rating=%s' % (self.ratingKey, rating)
+        self._server.query(key, method=self._server._session.put)
 
 
 class SplitMergeMixin(object):
@@ -487,3 +583,63 @@ class WriterMixin(object):
                 locked (bool): True (default) to lock the field, False to unlock the field.
         """
         self._edit_tags('writer', writers, locked=locked, remove=True)
+
+
+class SmartFilterMixin(object):
+    """ Mixing for Plex objects that can have smart filters. """
+
+    def _parseFilters(self, content):
+        """ Parse the content string and returns the filter dict. """
+        content = urlsplit(unquote(content))
+        filters = {}
+        filterOp = 'and'
+        filterGroups = [[]]
+        
+        for key, value in parse_qsl(content.query):
+            # Move = sign to key when operator is ==
+            if value.startswith('='):
+                key += '='
+                value = value[1:]
+
+            if key == 'includeGuids':
+                filters['includeGuids'] = int(value)
+            elif key == 'type':
+                filters['libtype'] = utils.reverseSearchType(value)
+            elif key == 'sort':
+                filters['sort'] = value.split(',')
+            elif key == 'limit':
+                filters['limit'] = int(value)
+            elif key == 'push':
+                filterGroups[-1].append([])
+                filterGroups.append(filterGroups[-1][-1])
+            elif key == 'and':
+                filterOp = 'and'
+            elif key == 'or':
+                filterOp = 'or'
+            elif key == 'pop':
+                filterGroups[-1].insert(0, filterOp)
+                filterGroups.pop()
+            else:
+                filterGroups[-1].append({key: value})
+        
+        if filterGroups:
+            filters['filters'] = self._formatFilterGroups(filterGroups.pop())
+        return filters
+    
+    def _formatFilterGroups(self, groups):
+        """ Formats the filter groups into the advanced search rules. """
+        if len(groups) == 1 and isinstance(groups[0], list):
+            groups = groups.pop()
+
+        filterOp = 'and'
+        rules = []
+
+        for g in groups:
+            if isinstance(g, list):
+                rules.append(self._formatFilterGroups(g))
+            elif isinstance(g, dict):
+                rules.append(g)
+            elif g in {'and', 'or'}:
+                filterOp = g
+
+        return {filterOp: rules}

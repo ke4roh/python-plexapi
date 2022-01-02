@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
+from plexapi.exceptions import BadRequest, NotFound
 from plexapi.utils import tag_singular
+import pytest
 
 from . import conftest as utils
 
@@ -76,7 +78,34 @@ def edit_writer(obj):
     _test_mixins_tag(obj, "writers", "Writer")
 
 
-def _test_mixins_image(obj, attr):
+def _test_mixins_lock_image(obj, attr):
+    cap_attr = attr[:-1].capitalize()
+    lock_img_method = getattr(obj, "lock" + cap_attr)
+    unlock_img_method = getattr(obj, "unlock" + cap_attr)
+    field = "thumb" if attr == 'posters' else attr[:-1]
+    _fields = lambda: [f.name for f in obj.fields]
+    assert field not in _fields()
+    lock_img_method()
+    obj.reload()
+    assert field in _fields()
+    unlock_img_method()
+    obj.reload()
+    assert field not in _fields()
+
+
+def lock_art(obj):
+    _test_mixins_lock_image(obj, "arts")
+
+
+def lock_banner(obj):
+    _test_mixins_lock_image(obj, "banners")
+
+
+def lock_poster(obj):
+    _test_mixins_lock_image(obj, "posters")
+
+
+def _test_mixins_edit_image(obj, attr):
     cap_attr = attr[:-1].capitalize()
     get_img_method = getattr(obj, attr)
     set_img_method = getattr(obj, "set" + cap_attr)
@@ -104,45 +133,93 @@ def _test_mixins_image(obj, attr):
     images = get_img_method()
     file_image = [
         i for i in images
-        if i.ratingKey.startswith('upload://') and i.ratingKey.endswith(CUTE_CAT_SHA1)
+        if i.ratingKey.startswith("upload://") and i.ratingKey.endswith(CUTE_CAT_SHA1)
     ]
     assert file_image
     # Reset to default image
     if default_image:
         set_img_method(default_image)
+    # Unlock the image
+    unlock_img_method = getattr(obj, "unlock" + cap_attr)
+    unlock_img_method()
 
 
 def edit_art(obj):
-    _test_mixins_image(obj, 'arts')
+    _test_mixins_edit_image(obj, "arts")
 
 
 def edit_banner(obj):
-    _test_mixins_image(obj, 'banners')
+    _test_mixins_edit_image(obj, "banners")
 
 
 def edit_poster(obj):
-    _test_mixins_image(obj, 'posters')
+    _test_mixins_edit_image(obj, "posters")
 
 
 def _test_mixins_imageUrl(obj, attr):
-    url = getattr(obj, attr + 'Url')
+    url = getattr(obj, attr + "Url")
     if getattr(obj, attr):
         assert url.startswith(utils.SERVER_BASEURL)
         assert "/library/metadata/" in url or "/library/collections/" in url
         assert attr in url or "composite" in url
-        if attr == 'thumb':
-            assert getattr(obj, 'posterUrl') == url
+        if attr == "thumb":
+            assert getattr(obj, "posterUrl") == url
     else:
         assert url is None
 
 
 def attr_artUrl(obj):
-    _test_mixins_imageUrl(obj, 'art')
+    _test_mixins_imageUrl(obj, "art")
 
 
 def attr_bannerUrl(obj):
-    _test_mixins_imageUrl(obj, 'banner')
+    _test_mixins_imageUrl(obj, "banner")
 
 
 def attr_posterUrl(obj):
-    _test_mixins_imageUrl(obj, 'thumb')
+    _test_mixins_imageUrl(obj, "thumb")
+
+
+def _test_mixins_editAdvanced(obj):
+    for pref in obj.preferences():
+        currentPref = obj.preference(pref.id)
+        currentValue = currentPref.value
+        newValue = next(v for v in pref.enumValues if v != currentValue)
+        obj.editAdvanced(**{pref.id: newValue})
+        obj.reload()
+        newPref = obj.preference(pref.id)
+        assert newPref.value == newValue
+
+
+def _test_mixins_editAdvanced_bad_pref(obj):
+    with pytest.raises(NotFound):
+        assert obj.preference("bad-pref")
+
+
+def _test_mixins_defaultAdvanced(obj):
+    obj.defaultAdvanced()
+    obj.reload()
+    for pref in obj.preferences():
+        assert pref.value == pref.default
+
+
+def edit_advanced_settings(obj):
+    _test_mixins_editAdvanced(obj)
+    _test_mixins_editAdvanced_bad_pref(obj)
+    _test_mixins_defaultAdvanced(obj)
+
+
+def edit_rating(obj):
+    obj.rate(10.0)
+    obj.reload()
+    assert utils.is_datetime(obj.lastRatedAt)
+    assert obj.userRating == 10.0
+    obj.rate()
+    obj.reload()
+    assert obj.userRating is None
+    with pytest.raises(BadRequest):
+        assert obj.rate("bad-rating")
+    with pytest.raises(BadRequest):
+        assert obj.rate(-1)
+    with pytest.raises(BadRequest):
+        assert obj.rate(100)

@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
+import os
 from urllib.parse import quote_plus
 
 from plexapi import media, utils, video
 from plexapi.base import Playable, PlexPartialObject
 from plexapi.exceptions import BadRequest
-from plexapi.mixins import ArtUrlMixin, ArtMixin, PosterUrlMixin, PosterMixin, TagMixin
+from plexapi.mixins import ArtUrlMixin, ArtMixin, PosterUrlMixin, PosterMixin, RatingMixin, TagMixin
 
 
 @utils.registerPlexObject
-class Photoalbum(PlexPartialObject, ArtMixin, PosterMixin):
+class Photoalbum(PlexPartialObject, ArtMixin, PosterMixin, RatingMixin):
     """ Represents a single Photoalbum (collection of photos).
 
         Attributes:
@@ -21,6 +22,7 @@ class Photoalbum(PlexPartialObject, ArtMixin, PosterMixin):
             guid (str): Plex GUID for the photo album (local://229674).
             index (sting): Plex index number for the photo album.
             key (str): API URL (/library/metadata/<ratingkey>).
+            lastRatedAt (datetime): Datetime the photo album was last rated.
             librarySectionID (int): :class:`~plexapi.library.LibrarySection` ID.
             librarySectionKey (str): :class:`~plexapi.library.LibrarySection` key.
             librarySectionTitle (str): :class:`~plexapi.library.LibrarySection` title.
@@ -32,7 +34,7 @@ class Photoalbum(PlexPartialObject, ArtMixin, PosterMixin):
             titleSort (str): Title to use when sorting (defaults to title).
             type (str): 'photo'
             updatedAt (datatime): Datetime the photo album was updated.
-            userRating (float): Rating of the photoalbum (0.0 - 10.0) equaling (0 stars - 5 stars).
+            userRating (float): Rating of the photo album (0.0 - 10.0) equaling (0 stars - 5 stars).
     """
     TAG = 'Directory'
     TYPE = 'photo'
@@ -46,7 +48,8 @@ class Photoalbum(PlexPartialObject, ArtMixin, PosterMixin):
         self.guid = data.attrib.get('guid')
         self.index = utils.cast(int, data.attrib.get('index'))
         self.key = data.attrib.get('key', '').replace('/children', '')  # FIX_BUG_50
-        self.librarySectionID = data.attrib.get('librarySectionID')
+        self.lastRatedAt = utils.toDatetime(data.attrib.get('lastRatedAt'))
+        self.librarySectionID = utils.cast(int, data.attrib.get('librarySectionID'))
         self.librarySectionKey = data.attrib.get('librarySectionKey')
         self.librarySectionTitle = data.attrib.get('librarySectionTitle')
         self.listType = 'photo'
@@ -57,7 +60,7 @@ class Photoalbum(PlexPartialObject, ArtMixin, PosterMixin):
         self.titleSort = data.attrib.get('titleSort', self.title)
         self.type = data.attrib.get('type')
         self.updatedAt = utils.toDatetime(data.attrib.get('updatedAt'))
-        self.userRating = utils.cast(float, data.attrib.get('userRating', 0))
+        self.userRating = utils.cast(float, data.attrib.get('userRating'))
 
     def album(self, title):
         """ Returns the :class:`~plexapi.photo.Photoalbum` that matches the specified title.
@@ -105,39 +108,30 @@ class Photoalbum(PlexPartialObject, ArtMixin, PosterMixin):
         """ Alias to :func:`~plexapi.photo.Photoalbum.photo`. """
         return self.episode(title)
 
-    def iterParts(self):
-        """ Iterates over the parts of the media item. """
-        for album in self.albums():
-            for photo in album.photos():
-                for part in photo.iterParts():
-                    yield part
-
-    def download(self, savepath=None, keep_original_name=False, showstatus=False):
-        """ Download photo files to specified directory.
+    def download(self, savepath=None, keep_original_name=False, subfolders=False):
+        """ Download all photos and clips from the photo ablum. See :func:`~plexapi.base.Playable.download` for details.
 
             Parameters:
                 savepath (str): Defaults to current working dir.
-                keep_original_name (bool): True to keep the original file name otherwise
-                    a friendlier is generated.
-                showstatus(bool): Display a progressbar.
+                keep_original_name (bool): True to keep the original filename otherwise
+                    a friendlier filename is generated.
+                subfolders (bool): True to separate photos/clips in to photo album folders.
         """
         filepaths = []
-        locations = [i for i in self.iterParts() if i]
-        for location in locations:
-            name = location.file
-            if not keep_original_name:
-                title = self.title.replace(' ', '.')
-                name = '%s.%s' % (title, location.container)
-            url = self._server.url('%s?download=1' % location.key)
-            filepath = utils.download(url, self._server._token, filename=name, showstatus=showstatus,
-                                      savepath=savepath, session=self._server._session)
-            if filepath:
-                filepaths.append(filepath)
+        for album in self.albums():
+            _savepath = os.path.join(savepath, album.title) if subfolders else savepath
+            filepaths += album.download(_savepath, keep_original_name)
+        for photo in self.photos() + self.clips():
+            filepaths += photo.download(savepath, keep_original_name)
         return filepaths
+
+    def _getWebURL(self, base=None):
+        """ Get the Plex Web URL with the correct parameters. """
+        return self._server._buildWebURL(base=base, endpoint='details', key=self.key, legacy=1)
 
 
 @utils.registerPlexObject
-class Photo(PlexPartialObject, Playable, ArtUrlMixin, PosterUrlMixin, TagMixin):
+class Photo(PlexPartialObject, Playable, ArtUrlMixin, PosterUrlMixin, RatingMixin, TagMixin):
     """ Represents a single Photo.
 
         Attributes:
@@ -150,6 +144,7 @@ class Photo(PlexPartialObject, Playable, ArtUrlMixin, PosterUrlMixin, TagMixin):
             guid (str): Plex GUID for the photo (com.plexapp.agents.none://231714?lang=xn).
             index (sting): Plex index number for the photo.
             key (str): API URL (/library/metadata/<ratingkey>).
+            lastRatedAt (datetime): Datetime the photo was last rated.
             librarySectionID (int): :class:`~plexapi.library.LibrarySection` ID.
             librarySectionKey (str): :class:`~plexapi.library.LibrarySection` key.
             librarySectionTitle (str): :class:`~plexapi.library.LibrarySection` title.
@@ -170,6 +165,7 @@ class Photo(PlexPartialObject, Playable, ArtUrlMixin, PosterUrlMixin, TagMixin):
             titleSort (str): Title to use when sorting (defaults to title).
             type (str): 'photo'
             updatedAt (datatime): Datetime the photo was updated.
+            userRating (float): Rating of the photo (0.0 - 10.0) equaling (0 stars - 5 stars).
             year (int): Year the photo was taken.
     """
     TAG = 'Photo'
@@ -186,7 +182,8 @@ class Photo(PlexPartialObject, Playable, ArtUrlMixin, PosterUrlMixin, TagMixin):
         self.guid = data.attrib.get('guid')
         self.index = utils.cast(int, data.attrib.get('index'))
         self.key = data.attrib.get('key', '')
-        self.librarySectionID = data.attrib.get('librarySectionID')
+        self.lastRatedAt = utils.toDatetime(data.attrib.get('lastRatedAt'))
+        self.librarySectionID = utils.cast(int, data.attrib.get('librarySectionID'))
         self.librarySectionKey = data.attrib.get('librarySectionKey')
         self.librarySectionTitle = data.attrib.get('librarySectionTitle')
         self.listType = 'photo'
@@ -206,7 +203,14 @@ class Photo(PlexPartialObject, Playable, ArtUrlMixin, PosterUrlMixin, TagMixin):
         self.titleSort = data.attrib.get('titleSort', self.title)
         self.type = data.attrib.get('type')
         self.updatedAt = utils.toDatetime(data.attrib.get('updatedAt'))
+        self.userRating = utils.cast(float, data.attrib.get('userRating'))
         self.year = utils.cast(int, data.attrib.get('year'))
+
+    def _prettyfilename(self):
+        """ Returns a filename for use in download. """
+        if self.parentTitle:
+            return '%s - %s' % (self.parentTitle, self.title)
+        return self.title
 
     def photoalbum(self):
         """ Return the photo's :class:`~plexapi.photo.Photoalbum`. """
@@ -226,17 +230,11 @@ class Photo(PlexPartialObject, Playable, ArtUrlMixin, PosterUrlMixin, TagMixin):
         """ This does not exist in plex xml response but is added to have a common
             interface to get the locations of the photo.
 
-            Retruns:
+            Returns:
                 List<str> of file paths where the photo is found on disk.
         """
         return [part.file for item in self.media for part in item.parts if part]
         
-    def iterParts(self):
-        """ Iterates over the parts of the media item. """
-        for item in self.media:
-            for part in item.parts:
-                yield part
-
     def sync(self, resolution, client=None, clientId=None, limit=None, title=None):
         """ Add current photo as sync item for specified device.
             See :func:`~plexapi.myplex.MyPlexAccount.sync` for possible exceptions.
@@ -273,25 +271,6 @@ class Photo(PlexPartialObject, Playable, ArtUrlMixin, PosterUrlMixin, TagMixin):
 
         return myplex.sync(sync_item, client=client, clientId=clientId)
 
-    def download(self, savepath=None, keep_original_name=False, showstatus=False):
-        """ Download photo files to specified directory.
-
-            Parameters:
-                savepath (str): Defaults to current working dir.
-                keep_original_name (bool): True to keep the original file name otherwise
-                    a friendlier is generated.
-                showstatus(bool): Display a progressbar.
-        """
-        filepaths = []
-        locations = [i for i in self.iterParts() if i]
-        for location in locations:
-            name = location.file
-            if not keep_original_name:
-                title = self.title.replace(' ', '.')
-                name = '%s.%s' % (title, location.container)
-            url = self._server.url('%s?download=1' % location.key)
-            filepath = utils.download(url, self._server._token, filename=name, showstatus=showstatus,
-                                      savepath=savepath, session=self._server._session)
-            if filepath:
-                filepaths.append(filepath)
-        return filepaths
+    def _getWebURL(self, base=None):
+        """ Get the Plex Web URL with the correct parameters. """
+        return self._server._buildWebURL(base=base, endpoint='details', key=self.parentKey, legacy=1)

@@ -2,13 +2,14 @@
 import re
 import weakref
 from urllib.parse import quote_plus, urlencode
+from xml.etree import ElementTree
 
 from plexapi import log, utils
 from plexapi.exceptions import BadRequest, NotFound, UnknownType, Unsupported
-from plexapi.utils import tag_plural, tag_helper
 
-DONT_RELOAD_FOR_KEYS = {'key', 'session'}
-DONT_OVERWRITE_SESSION_KEYS = {'usernames', 'players', 'transcodeSessions', 'session'}
+USER_DONT_RELOAD_FOR_KEYS = set()
+_DONT_RELOAD_FOR_KEYS = {'key', 'session'}
+_DONT_OVERWRITE_SESSION_KEYS = {'usernames', 'players', 'transcodeSessions', 'session'}
 OPERATORS = {
     'exact': lambda v, q: v == q,
     'iexact': lambda v, q: v.lower() == q.lower(),
@@ -47,11 +48,12 @@ class PlexObject(object):
         self._server = server
         self._data = data
         self._initpath = initpath or self.key
-        self._parent = weakref.ref(parent) if parent else None
+        self._parent = weakref.ref(parent) if parent is not None else None
         self._details_key = None
         if data is not None:
             self._loadData(data)
         self._details_key = self._buildDetailsKey()
+        self._autoReload = False
 
     def __repr__(self):
         uid = self._clean(self.firstAttr('_baseurl', 'key', 'id', 'playQueueID', 'uri'))
@@ -60,10 +62,12 @@ class PlexObject(object):
 
     def __setattr__(self, attr, value):
         # Don't overwrite session specific attr with []
-        if attr in DONT_OVERWRITE_SESSION_KEYS and value == []:
+        if attr in _DONT_OVERWRITE_SESSION_KEYS and value == []:
             value = getattr(self, attr, [])
-        # Don't overwrite an attr with None unless it's a private variable
-        if value is not None or attr.startswith('_') or attr not in self.__dict__:
+
+        autoReload = self.__dict__.get('_autoReload')
+        # Don't overwrite an attr with None unless it's a private variable or not auto reload
+        if value is not None or attr.startswith('_') or attr not in self.__dict__ or not autoReload:
             self.__dict__[attr] = value
 
     def _clean(self, value):
@@ -130,6 +134,19 @@ class PlexObject(object):
                 return True
         return False
 
+    def _manuallyLoadXML(self, xml, cls=None):
+        """ Manually load an XML string as a :class:`~plexapi.base.PlexObject`.
+
+            Parameters:
+                xml (str): The XML string to load.
+                cls (:class:`~plexapi.base.PlexObject`): If you know the class of the
+                    items to be fetched, passing this in will help the parser ensure
+                    it only returns those items. By default we convert the xml elements
+                    with the best guess PlexObjects based on tag and type attrs.
+        """
+        elem = ElementTree.fromstring(xml)
+        return self._buildItemOrNone(elem, cls)
+
     def fetchItem(self, ekey, cls=None, **kwargs):
         """ Load the specified key to find and build the first item with the
             specified tag and attrs. If no tag or attrs are specified then
@@ -144,34 +161,9 @@ class PlexObject(object):
                     it only returns those items. By default we convert the xml elements
                     with the best guess PlexObjects based on tag and type attrs.
                 etag (str): Only fetch items with the specified tag.
-                **kwargs (dict): Optionally add attribute filters on the items to fetch. For
-                    example, passing in viewCount=0 will only return matching items. Filtering
-                    is done before the Python objects are built to help keep things speedy.
-                    Note: Because some attribute names are already used as arguments to this
-                    function, such as 'tag', you may still reference the attr tag byappending
-                    an underscore. For example, passing in _tag='foobar' will return all items
-                    where tag='foobar'. Also Note: Case very much matters when specifying kwargs
-                    -- Optionally, operators can be specified by append it
-                    to the end of the attribute name for more complex lookups. For example,
-                    passing in viewCount__gte=0 will return all items where viewCount >= 0.
-                    Available operations include:
-
-                    * __contains: Value contains specified arg.
-                    * __endswith: Value ends with specified arg.
-                    * __exact: Value matches specified arg.
-                    * __exists (bool): Value is or is not present in the attrs.
-                    * __gt: Value is greater than specified arg.
-                    * __gte: Value is greater than or equal to specified arg.
-                    * __icontains: Case insensative value contains specified arg.
-                    * __iendswith: Case insensative value ends with specified arg.
-                    * __iexact: Case insensative value matches specified arg.
-                    * __in: Value is in a specified list or tuple.
-                    * __iregex: Case insensative value matches the specified regular expression.
-                    * __istartswith: Case insensative value starts with specified arg.
-                    * __lt: Value is less than specified arg.
-                    * __lte: Value is less than or equal to specified arg.
-                    * __regex: Value matches the specified regular expression.
-                    * __startswith: Value starts with specified arg.
+                **kwargs (dict): Optionally add XML attribute to filter the items.
+                    See :func:`~plexapi.base.PlexObject.fetchItems` for more details
+                    on how this is used.
         """
         if ekey is None:
             raise BadRequest('ekey was not provided')
@@ -185,12 +177,76 @@ class PlexObject(object):
 
     def fetchItems(self, ekey, cls=None, container_start=None, container_size=None, **kwargs):
         """ Load the specified key to find and build all items with the specified tag
-            and attrs. See :func:`~plexapi.base.PlexObject.fetchItem` for more details
-            on how this is used.
+            and attrs.
 
             Parameters:
+                ekey (str): API URL path in Plex to fetch items from.
+                cls (:class:`~plexapi.base.PlexObject`): If you know the class of the
+                    items to be fetched, passing this in will help the parser ensure
+                    it only returns those items. By default we convert the xml elements
+                    with the best guess PlexObjects based on tag and type attrs.
+                etag (str): Only fetch items with the specified tag.
                 container_start (None, int): offset to get a subset of the data
                 container_size (None, int): How many items in data
+                **kwargs (dict): Optionally add XML attribute to filter the items.
+                    See the details below for more info.
+
+            **Filtering XML Attributes**
+
+            Any XML attribute can be filtered when fetching results. Filtering is done before
+            the Python objects are built to help keep things speedy. For example, passing in
+            ``viewCount=0`` will only return matching items where the view count is ``0``.
+            Note that case matters when specifying attributes. Attributes futher down in the XML
+            tree can be filtered by *prepending* the attribute with each element tag ``Tag__``.
+
+            Examples:
+
+                .. code-block:: python
+
+                    fetchItem(ekey, viewCount=0)
+                    fetchItem(ekey, contentRating="PG")
+                    fetchItem(ekey, Genre__tag="Animation")
+                    fetchItem(ekey, Media__videoCodec="h265")
+                    fetchItem(ekey, Media__Part__container="mp4)
+
+            Note that because some attribute names are already used as arguments to this
+            function, such as ``tag``, you may still reference the attr tag by prepending an
+            underscore. For example, passing in ``_tag='foobar'`` will return all items where
+            ``tag='foobar'``.
+
+            **Using PlexAPI Operators**
+
+            Optionally, PlexAPI operators can be specified by *appending* it to the end of the
+            attribute for more complex lookups. For example, passing in ``viewCount__gte=0``
+            will return all items where ``viewCount >= 0``.
+
+            List of Available Operators:
+
+            * ``__contains``: Value contains specified arg.
+            * ``__endswith``: Value ends with specified arg.
+            * ``__exact``: Value matches specified arg.
+            * ``__exists`` (*bool*): Value is or is not present in the attrs.
+            * ``__gt``: Value is greater than specified arg.
+            * ``__gte``: Value is greater than or equal to specified arg.
+            * ``__icontains``: Case insensative value contains specified arg.
+            * ``__iendswith``: Case insensative value ends with specified arg.
+            * ``__iexact``: Case insensative value matches specified arg.
+            * ``__in``: Value is in a specified list or tuple.
+            * ``__iregex``: Case insensative value matches the specified regular expression.
+            * ``__istartswith``: Case insensative value starts with specified arg.
+            * ``__lt``: Value is less than specified arg.
+            * ``__lte``: Value is less than or equal to specified arg.
+            * ``__regex``: Value matches the specified regular expression.
+            * ``__startswith``: Value starts with specified arg.
+
+            Examples:
+
+                .. code-block:: python
+
+                    fetchItem(ekey, viewCount__gte=0)
+                    fetchItem(ekey, Media__container__in=["mp4", "mkv"])
+                    fetchItem(ekey, guid__iregex=r"(imdb:\/\/|themoviedb:\/\/)")
+                    fetchItem(ekey, Media__Part__file__startswith="D:\\Movies")
 
         """
         url_kw = {}
@@ -204,13 +260,13 @@ class PlexObject(object):
         data = self._server.query(ekey, params=url_kw)
         items = self.findItems(data, cls, ekey, **kwargs)
 
-        librarySectionID = data.attrib.get('librarySectionID')
+        librarySectionID = utils.cast(int, data.attrib.get('librarySectionID'))
         if librarySectionID:
             for item in items:
                 item.librarySectionID = librarySectionID
         return items
 
-    def findItems(self, data, cls=None, initpath=None, **kwargs):
+    def findItems(self, data, cls=None, initpath=None, rtag=None, **kwargs):
         """ Load the specified data to find and build all items with the specified tag
             and attrs. See :func:`~plexapi.base.PlexObject.fetchItem` for more details
             on how this is used.
@@ -220,6 +276,9 @@ class PlexObject(object):
             kwargs['etag'] = cls.TAG
         if cls and cls.TYPE and 'type' not in kwargs:
             kwargs['type'] = cls.TYPE
+        # rtag to iter on a specific root tag
+        if rtag:
+            data = next(data.iter(rtag), [])
         # loop through all data elements to find matches
         items = []
         for elem in data:
@@ -236,9 +295,12 @@ class PlexObject(object):
             if value is not None:
                 return value
 
-    def listAttrs(self, data, attr, **kwargs):
+    def listAttrs(self, data, attr, rtag=None, **kwargs):
         """ Return a list of values from matching attribute. """
         results = []
+        # rtag to iter on a specific root tag
+        if rtag:
+            data = next(data.iter(rtag), [])
         for elem in data:
             kwargs['%s__exists' % attr] = True
             if self._checkAttrs(elem, **kwargs):
@@ -276,13 +338,19 @@ class PlexObject(object):
                     movie.isFullObject()  # Returns True
 
         """
+        return self._reload(key=key, **kwargs)
+
+    def _reload(self, key=None, _autoReload=False, **kwargs):
+        """ Perform the actual reload. """
         details_key = self._buildDetailsKey(**kwargs) if kwargs else self._details_key
         key = key or details_key or self.key
         if not key:
             raise Unsupported('Cannot reload an object not built from a URL.')
         self._initpath = key
         data = self._server.query(key)
+        self._autoReload = _autoReload
         self._loadData(data[0])
+        self._autoReload = False
         return self
 
     def _checkAttrs(self, elem, **kwargs):
@@ -398,8 +466,9 @@ class PlexPartialObject(PlexObject):
         # Dragons inside.. :-/
         value = super(PlexPartialObject, self).__getattribute__(attr)
         # Check a few cases where we dont want to reload
-        if attr in DONT_RELOAD_FOR_KEYS: return value
-        if attr in DONT_OVERWRITE_SESSION_KEYS: return value
+        if attr in _DONT_RELOAD_FOR_KEYS: return value
+        if attr in _DONT_OVERWRITE_SESSION_KEYS: return value
+        if attr in USER_DONT_RELOAD_FOR_KEYS: return value
         if attr.startswith('_'): return value
         if value not in (None, []): return value
         if self.isFullObject(): return value
@@ -409,7 +478,7 @@ class PlexPartialObject(PlexObject):
         objname = "%s '%s'" % (clsname, title) if title else clsname
         log.debug("Reloading %s for attr '%s'", objname, attr)
         # Reload and return the value
-        self.reload()
+        self._reload(_autoReload=True)
         return super(PlexPartialObject, self).__getattribute__(attr)
 
     def analyze(self):
@@ -435,7 +504,7 @@ class PlexPartialObject(PlexObject):
         self._server.query(key, method=self._server._session.put)
 
     def isFullObject(self):
-        """ Retruns True if this is already a full object. A full object means all attributes
+        """ Returns True if this is already a full object. A full object means all attributes
             were populated from the api path representing only this item. For example, the
             search result for a movie often only contain a portion of the attributes a full
             object (main url) for that movie would contain.
@@ -445,6 +514,17 @@ class PlexPartialObject(PlexObject):
     def isPartialObject(self):
         """ Returns True if this is not a full object. """
         return not self.isFullObject()
+
+    def _edit(self, **kwargs):
+        """ Actually edit an object. """
+        if 'id' not in kwargs:
+            kwargs['id'] = self.ratingKey
+        if 'type' not in kwargs:
+            kwargs['type'] = utils.searchType(self.type)
+
+        part = '/library/sections/%s/all?%s' % (self.librarySectionID,
+                                                urlencode(kwargs))
+        self._server.query(part, method=self._server._session.put)
 
     def edit(self, **kwargs):
         """ Edit an object.
@@ -458,14 +538,7 @@ class PlexPartialObject(PlexObject):
                  'collection[0].tag.tag': 'Super',
                  'collection.locked': 0}
         """
-        if 'id' not in kwargs:
-            kwargs['id'] = self.ratingKey
-        if 'type' not in kwargs:
-            kwargs['type'] = utils.searchType(self.type)
-
-        part = '/library/sections/%s/all?%s' % (self.librarySectionID,
-                                                urlencode(kwargs))
-        self._server.query(part, method=self._server._session.put)
+        self._edit(**kwargs)
 
     def _edit_tags(self, tag, items, locked=True, remove=False):
         """ Helper to edit tags.
@@ -478,9 +551,9 @@ class PlexPartialObject(PlexObject):
         """
         if not isinstance(items, list):
             items = [items]
-        value = getattr(self, tag_plural(tag))
+        value = getattr(self, utils.tag_plural(tag))
         existing_tags = [t.tag for t in value if t and remove is False]
-        tag_edits = tag_helper(tag, existing_tags + items, locked, remove)
+        tag_edits = utils.tag_helper(tag, existing_tags + items, locked, remove)
         self.edit(**tag_edits)
 
     def refresh(self):
@@ -516,11 +589,27 @@ class PlexPartialObject(PlexObject):
 
     def history(self, maxresults=9999999, mindate=None):
         """ Get Play History for a media item.
+
             Parameters:
                 maxresults (int): Only return the specified number of results (optional).
                 mindate (datetime): Min datetime to return results from.
         """
         return self._server.history(maxresults=maxresults, mindate=mindate, ratingKey=self.ratingKey)
+
+    def _getWebURL(self, base=None):
+        """ Get the Plex Web URL with the correct parameters.
+            Private method to allow overriding parameters from subclasses.
+        """
+        return self._server._buildWebURL(base=base, endpoint='details', key=self.key)
+
+    def getWebURL(self, base=None):
+        """ Returns the Plex Web URL for a media item.
+
+            Parameters:
+                base (str): The base URL before the fragment (``#!``).
+                    Default is https://app.plex.tv/desktop.
+        """
+        return self._getWebURL(base=base)
 
 
 class Playable(object):
@@ -536,6 +625,8 @@ class Playable(object):
             transcodeSessions (:class:`~plexapi.media.TranscodeSession`): Transcode Session object
                 if item is being transcoded (None otherwise).
             viewedAt (datetime): Datetime item was last viewed (history).
+            accountID (int): The associated :class:`~plexapi.server.SystemAccount` ID.
+            deviceID (int): The associated :class:`~plexapi.server.SystemDevice` ID.
             playlistItemID (int): Playlist item ID (only populated for :class:`~plexapi.playlist.Playlist` items).
             playQueueItemID (int): PlayQueue item ID (only populated for :class:`~plexapi.playlist.PlayQueue` items).
     """
@@ -548,6 +639,7 @@ class Playable(object):
         self.session = self.findItems(data, etag='Session')                         # session
         self.viewedAt = utils.toDatetime(data.attrib.get('viewedAt'))               # history
         self.accountID = utils.cast(int, data.attrib.get('accountID'))              # history
+        self.deviceID = utils.cast(int, data.attrib.get('deviceID'))                # history
         self.playlistItemID = utils.cast(int, data.attrib.get('playlistItemID'))    # playlist
         self.playQueueItemID = utils.cast(int, data.attrib.get('playQueueItemID'))  # playqueue
 
@@ -562,7 +654,7 @@ class Playable(object):
             Raises:
                 :exc:`~plexapi.exceptions.Unsupported`: When the item doesn't support fetching a stream URL.
         """
-        if self.TYPE not in ('movie', 'episode', 'track'):
+        if self.TYPE not in ('movie', 'episode', 'track', 'clip'):
             raise Unsupported('Fetching stream URL for %s is unsupported.' % self.TYPE)
         mvb = params.get('maxVideoBitrate')
         vr = params.get('videoResolution', '')
@@ -599,34 +691,50 @@ class Playable(object):
         client.playMedia(self)
 
     def download(self, savepath=None, keep_original_name=False, **kwargs):
-        """ Downloads this items media to the specified location. Returns a list of
+        """ Downloads the media item to the specified location. Returns a list of
             filepaths that have been saved to disk.
 
             Parameters:
-                savepath (str): Title of the track to return.
-                keep_original_name (bool): Set True to keep the original filename as stored in
-                    the Plex server. False will create a new filename with the format
-                    "<Artist> - <Album> <Track>".
-                kwargs (dict): If specified, a :func:`~plexapi.audio.Track.getStreamURL` will
-                    be returned and the additional arguments passed in will be sent to that
-                    function. If kwargs is not specified, the media items will be downloaded
-                    and saved to disk.
+                savepath (str): Defaults to current working dir.
+                keep_original_name (bool): True to keep the original filename otherwise
+                    a friendlier filename is generated. See filenames below.
+                **kwargs (dict): Additional options passed into :func:`~plexapi.audio.Track.getStreamURL`
+                    to download a transcoded stream, otherwise the media item will be downloaded
+                    as-is and saved to disk.
+
+            **Filenames**
+
+            * Movie: ``<title> (<year>)``
+            * Episode: ``<show title> - s00e00 - <episode title>``
+            * Track: ``<artist title> - <album title> - 00 - <track title>``
+            * Photo: ``<photoalbum title> - <photo/clip title>`` or ``<photo/clip title>``
         """
         filepaths = []
-        locations = [i for i in self.iterParts() if i]
-        for location in locations:
-            filename = location.file
-            if keep_original_name is False:
-                filename = '%s.%s' % (self._prettyfilename(), location.container)
-            # So this seems to be a alot slower but allows transcode.
+        parts = [i for i in self.iterParts() if i]
+
+        for part in parts:
+            if not keep_original_name:
+                filename = utils.cleanFilename('%s.%s' % (self._prettyfilename(), part.container))
+            else:
+                filename = part.file
+
             if kwargs:
+                # So this seems to be a alot slower but allows transcode.
                 download_url = self.getStreamURL(**kwargs)
             else:
-                download_url = self._server.url('%s?download=1' % location.key)
-            filepath = utils.download(download_url, self._server._token, filename=filename,
-                savepath=savepath, session=self._server._session)
+                download_url = self._server.url('%s?download=1' % part.key)
+
+            filepath = utils.download(
+                download_url,
+                self._server._token,
+                filename=filename,
+                savepath=savepath,
+                session=self._server._session
+            )
+
             if filepath:
                 filepaths.append(filepath)
+
         return filepaths
 
     def stop(self, reason=''):
@@ -648,7 +756,7 @@ class Playable(object):
         key = '/:/progress?key=%s&identifier=com.plexapp.plugins.library&time=%d&state=%s' % (self.ratingKey,
                                                                                               time, state)
         self._server.query(key)
-        self.reload()
+        self._reload(_autoReload=True)
 
     def updateTimeline(self, time, state='stopped', duration=None):
         """ Set the timeline progress for this video.
@@ -666,4 +774,35 @@ class Playable(object):
         key = '/:/timeline?ratingKey=%s&key=%s&identifier=com.plexapp.plugins.library&time=%d&state=%s%s'
         key %= (self.ratingKey, self.key, time, state, durationStr)
         self._server.query(key)
-        self.reload()
+        self._reload(_autoReload=True)
+
+
+class MediaContainer(PlexObject):
+    """ Represents a single MediaContainer.
+
+        Attributes:
+            TAG (str): 'MediaContainer'
+            allowSync (int): Sync/Download is allowed/disallowed for feature.
+            augmentationKey (str): API URL (/library/metadata/augmentations/<augmentationKey>).
+            identifier (str): "com.plexapp.plugins.library"
+            librarySectionID (int): :class:`~plexapi.library.LibrarySection` ID.
+            librarySectionTitle (str): :class:`~plexapi.library.LibrarySection` title.
+            librarySectionUUID (str): :class:`~plexapi.library.LibrarySection` UUID.
+            mediaTagPrefix (str): "/system/bundle/media/flags/"
+            mediaTagVersion (int): Unknown
+            size (int): The number of items in the hub.
+
+    """
+    TAG = 'MediaContainer'
+
+    def _loadData(self, data):
+        self._data = data
+        self.allowSync = utils.cast(int, data.attrib.get('allowSync'))
+        self.augmentationKey = data.attrib.get('augmentationKey')
+        self.identifier = data.attrib.get('identifier')
+        self.librarySectionID = utils.cast(int, data.attrib.get('librarySectionID'))
+        self.librarySectionTitle = data.attrib.get('librarySectionTitle')
+        self.librarySectionUUID = data.attrib.get('librarySectionUUID')
+        self.mediaTagPrefix = data.attrib.get('mediaTagPrefix')
+        self.mediaTagVersion = data.attrib.get('mediaTagVersion')
+        self.size = utils.cast(int, data.attrib.get('size'))
