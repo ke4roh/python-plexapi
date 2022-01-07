@@ -683,7 +683,7 @@ class PlexServer(PlexObject):
         url = self.url(key)
         method = method or self._session.get
         timeout = timeout or TIMEOUT
-        log.debug('%s %s', method.__name__.upper(), url)
+        log.debug('PlexServer._queryReturnResponse %s %s', method.__name__.upper(), url)
         headers = self._headers(**headers or {})
         response = method(url, headers=headers, timeout=timeout, **kwargs)
         return response

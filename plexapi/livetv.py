@@ -39,8 +39,8 @@ class Recording(Video):
 
     def _loadData(self, data):
         self._data = data
-        self.key = data.attrib.key('key')
-        self.type = data.attrib.key('type')
+        self.key = data.attrib.get('key')
+        self.type = data.attrib.get('type')
         self.targetLibrarySectionId = data.attrib.get('targetLibrarySectionId')
         self.createdAt = utils.toDatetime(data.attrib.get('createdAt'))
         self.title = data.attrib.get('title')
@@ -60,7 +60,7 @@ class ScheduledRecording(Video):
         self._data = data
         self.mediaSubscriptionID = data.attrib.get('mediaSubscriptionID')
         self.mediaIndex = data.attrib.get('mediaIndex')
-        self.key = data.attrib.key('key')
+        self.key = data.attrib.get('key')
         self.grabberIdentifier = data.attrib.get('grabberIdentifier')
         self.grabberProtocol = data.attrib.get('grabberProtocol')
         self.deviceID = data.attrib.get('deviceID')
@@ -70,9 +70,10 @@ class ScheduledRecording(Video):
 
 
 @utils.registerPlexObject
-class Setting(PlexObject):
+class DVRSetting(PlexObject):
     """ Represents a single DVRDevice Setting."""
 
+    TAGTYPE = 'DVRSetting'
     TAG = 'Setting'
 
     def _loadData(self, data):
@@ -220,11 +221,11 @@ class LiveTV(PlexObject):
 
     @property
     def recordings(self):
-        return self.fetchItems('/media/subscriptions/scheduled')
+        return self.fetchItems('/media/subscriptions/scheduled', cls=ScheduledRecording)
 
     @property
     def scheduled(self):
-        return self.fetchItems('/media/subscriptions')
+        return self.fetchItems('/media/subscriptions', cls=Recording)
 
     def _guide_items(self, key, grid_type: int, beginsAt: datetime = None, endsAt: datetime = None):
         """ Returns a list of all guide items

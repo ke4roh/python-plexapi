@@ -72,7 +72,7 @@ class Media(PlexObject):
         self.channelTitle = data.attrib.get('channelTitle')
         self.beginsAt = utils.toDatetime(data.attrib.get('beginsAt'))
         self.endsAt = utils.toDatetime(data.attrib.get('endsAt'))
-        self.onAir = cast(int, data.attrib.get('onAir'))
+        self.onAir = utils.cast(int, data.attrib.get('onAir'))
         self.channelID = data.attrib.get('channelID')
         self.videoCodec = data.attrib.get('videoCodec')
         self.videoFrameRate = data.attrib.get('videoFrameRate')

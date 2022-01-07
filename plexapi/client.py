@@ -177,7 +177,7 @@ class PlexClient(PlexObject):
         url = self.url(path)
         method = method or self._session.get
         timeout = timeout or TIMEOUT
-        log.debug('%s %s', method.__name__.upper(), url)
+        log.debug('PlexClient.query %s %s', method.__name__.upper(), url)
         headers = self._headers(**headers or {})
         response = method(url, headers=headers, timeout=timeout, **kwargs)
         if response.status_code not in (200, 201, 204):

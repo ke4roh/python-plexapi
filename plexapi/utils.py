@@ -58,7 +58,7 @@ class SecretsFilter(logging.Filter):
 
 def registerPlexObject(cls):
     """ Registry of library types we may come across when parsing XML. This allows us to
-        define a few helper functions to dynamically convery the XML into objects. See
+        define a few helper functions to dynamically convert the XML into objects. See
         buildItem() below for an example.
     """
     etype = getattr(cls, 'STREAMTYPE', getattr(cls, 'TAGTYPE', cls.TYPE))
